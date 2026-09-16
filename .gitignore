@@ -12,6 +12,13 @@ state.tmp
 # Cleanup tool output — generated, and also full of your real subject lines.
 cleanup_plan.md
 cleanup_plan.json
+unsubscribe_candidates.json
+
+# Your panel settings: filter choices and your personal sender allowlist.
+config.json
+
+# launchd/cron output
+logs/
 
 # Python
 __pycache__/

@@ -33,21 +33,153 @@ This is deliberate. An agent that deletes on a misclassification turns a recover
 
 Every ambiguous call is resolved downward. When the model is unsure it keeps. When the API errors out or returns unparseable JSON, the message is left exactly where it was. When a subject line matches a hard-coded keyword like *assessment* or *interview*, it stays in your inbox regardless of what the classifier decided.
 
-## Three layers of protection
+## The settings panel
+
+```bash
+python src/ui_server.py
+```
+
+A 250×350 window: filter toggles, how often it checks, how often it digests,
+and your unsubscribe candidates. Stdlib only — no framework, no build step, no
+Electron. It writes `config.json`; the agent reads it on the next run.
+
+```
+┌─────────────────────────────┐
+│ Triage            3 queued  │
+│ Filters │ Timing │ Unsubs   │
+├─────────────────────────────┤
+│ FILE THESE OUT OF MY INBOX  │
+│ ☑ Application confirmations │
+│ ☑ Canvas & course platforms │
+│ ☑ Job board alerts          │
+│ ☑ Social notifications      │
+│ ☑ Marketing & promotions    │
+│ ☐ News & newsletters        │
+│ ☐ Receipts & orders         │
+│ ☐ Anything with unsubscribe │
+│ ☐ no-reply@ senders  ⚠      │
+│                             │
+│ NEVER FILE THESE SENDERS    │
+│ ┌─────────────────────────┐ │
+│ │ @youruniversity.edu     │ │
+│ └─────────────────────────┘ │
+├─────────────────────────────┤
+│ [         Save          ]   │
+└─────────────────────────────┘
+```
+
+It binds `127.0.0.1` only, and every request needs a token minted at startup
+and present just in the URL it opens. Localhost alone wouldn't be enough: any
+page in your browser can make requests to localhost, and the panel rewrites
+your filter rules.
+
+### A warning about the no-reply@ toggle
+
+It's the most obvious rule to want and the most dangerous one to enable.
+HackerRank, CodeSignal, Workday, and Greenhouse all send assessment invites
+from `no-reply@`. A naive "file all no-reply mail" rule files the exact email
+this project exists to catch.
+
+So the rules are layered, highest priority first:
+
+| | Layer | Wins over |
+|---|---|---|
+| 1 | Your allowlist | everything |
+| 2 | Keyword protection — *assessment, interview, deadline, offer, verification code* | rules + model |
+| 3 | Your toggles | the model |
+| 4 | The model | — |
+| 5 | Any failure → stays in inbox | — |
+
+Toggles sit at layer 3, under the keyword protection. That ordering is what
+makes the no-reply rule safe to switch on at all, and it's covered by a test
+that fails if the layers are ever reordered.
+
+Rules are also free. A message a rule catches is filed without an API call, so
+turning toggles on makes the agent both cheaper and more predictable — in a
+7-message sample with five rules on, 4 were filed deterministically and only 3
+reached the model.
+
+## Unsubscribe candidates
+
+```bash
+MAIL_BACKEND=imap python src/subscriptions.py
+```
+
+Groups mail across your inbox and `Filtered` by sender, then asks the one
+question a mailbox can actually answer: how much does this sender send, and
+how much of it do you ever open?
+
+```
+LinkedIn Job Alerts <noreply@linkedin.com>
+  312 received · opened 4 (1%) · last 2026-09-16
+  URL  https://www.linkedin.com/comm/psettings/email-unsubscribe?...
+
+Morning Brew <crew@morningbrew.com>
+  118 received · opened 9 (8%) · last 2026-09-16
+  MAILTO  unsubscribe@morningbrew.com
+```
+
+Ranked by volume you ignore, so 300 unread beats 6 unread. The results show up
+in the panel's Unsubs tab.
+
+**It never unsubscribes for you.** It extracts the target from the
+`List-Unsubscribe` header and hands you the link. Clicking unsubscribe in mail
+you didn't ask for confirms your address is live, and a one-click HTTP
+unsubscribe is an outbound action in your name — a `mailto:` target is a plain
+request, a `url` target is a tracked endpoint. Which to trust is your call, so
+the tool doesn't make it. It prefers showing you the `mailto:` when both exist.
+
+Two honest caveats on the read signal:
+
+- `\Seen` means "opened, **or** scrolled past in a preview pane". A three-pane
+  mail client inflates it, so your real read rate may be lower than shown.
+- The triage agent reads with `BODY.PEEK` and never sets `\Seen`, so it doesn't
+  pollute its own numbers.
+
+## How often it runs
+
+Set it in the panel's Timing tab, then apply it:
+
+```bash
+python src/schedule_agent.py install    # writes launchd jobs from config.json
+python src/schedule_agent.py status
+python src/schedule_agent.py cron       # prints cron lines instead, for Linux
+```
+
+Checking for mail and notifying you are separate settings, and they want
+opposite answers:
+
+| | Options | Good choice |
+|---|---|---|
+| **Check for new mail** | 15m · 1h · 4h · 6h · 8h · 12h | **15 minutes** |
+| **Email me a digest** | 1× · 2× · 3× · 4× a day | **3× a day** |
+
+Checking every 15 minutes costs the same as checking every 8 hours. You're
+billed per email classified, not per check, and the mail arrives either way —
+so a slow interval buys you nothing and can leave a timed assessment unflagged
+for 8 hours. Space out the *digest* instead. That's the thing that interrupts
+you, and 3× a day is about right.
+
+The panel warns you inline when you pick an interval of 8 hours or more.
+
+## Where the protections live in code
 
 Classification is a judgment call, so it isn't the only thing standing between you and a missed deadline.
 
-1. **Allowlist.** Senders matching `NEVER_FILTER` are never filed. Put your university domain, your advisor, and any recruiter you're talking to here.
-2. **Keyword override.** Subject lines matching `HARD_KEEP_PATTERNS` stay in the inbox and get flagged even if the classifier said noise. Assessment platform names, "deadline", "expires", "action required", verification codes.
-3. **Fail-safe default.** Anything that can't be classified stays put.
+1. **Allowlist.** The panel's "never file these senders" box, plus the `NEVER_FILTER` environment variable. Substring match on sender and reply-to.
+2. **Keyword override.** `HARD_KEEP_PATTERNS` in [`src/icloud_triage.py`](src/icloud_triage.py) — assessment platform names, "deadline", "expires", "action required", verification codes. Edit this list directly; it's plain regex.
+3. **Your toggles.** `RULES` in [`src/settings.py`](src/settings.py), also plain regex. Add your own.
+4. **Fail-safe default.** Anything that can't be classified stays put.
 
 ## How it works
 
 ```
-every 15 min ──> fetch new mail ──> classify in batches ──> flag or file
-                                          │
-                                          └──> queue for digest
-8am & 6pm ────> send digest ──────────────┘
+                          ┌─ allowlisted or protected keyword? ─> keep, flag
+every 15 min ─> fetch ────┼─ matches one of your toggles? ─────> file (free)
+                          └─ otherwise ──> ask the model ──────> flag or file
+                                                  │
+                                                  └──> queue for digest
+3× a day ────> send digest ───────────────────────┘
 ```
 
 Messages are fetched with `BODY.PEEK` (IMAP) or read without setting read status (AppleScript), so **nothing is ever marked as read** by the agent. Your unread count stays honest.
@@ -107,10 +239,12 @@ export ANTHROPIC_API_KEY=sk-ant-...
 export DIGEST_TO=you@icloud.com
 
 python src/icloud_triage.py test              # verify connections
+python src/ui_server.py                       # pick your filters and cadence
 python src/icloud_triage.py triage --dry-run  # classify without acting
+python src/schedule_agent.py install          # run it on a timer
 ```
 
-**Run the dry run for a day or two before letting it act.** It prints every decision and changes nothing. That's when you find out it wants to file your career center's emails, and you add them to `NEVER_FILTER`.
+**Run the dry run for a day or two before letting it act.** It prints every decision and changes nothing. That's when you find out it wants to file your career center's emails, and you add them to the allowlist.
 
 ## Tests
 
@@ -126,11 +260,14 @@ break silently: a backend that doesn't hand triage every field it reads.
 
 If it files something you wanted, in order of what to try:
 
-1. Add the sender to `NEVER_FILTER`
-2. Add a subject pattern to `HARD_KEEP_PATTERNS`
-3. Edit the category descriptions in `SYSTEM_PROMPT` — plain English edits work, and naming actual senders ("Handshake digests", "Canvas notifications") works better than abstract rules
+1. Add the sender to the allowlist in the panel
+2. Turn off whichever toggle caught it — the digest names the rule that fired
+3. Add a subject pattern to `HARD_KEEP_PATTERNS` in [`src/icloud_triage.py`](src/icloud_triage.py)
+4. Edit the category descriptions in `SYSTEM_PROMPT` — plain English edits work, and naming actual senders ("Handshake digests", "Canvas notifications") works better than abstract rules
 
 The prompt is the real brain here. It's written for a specific person — a student applying to jobs — and it will get better the more it knows about yours.
+
+Mail filed by a rule says so in the digest (`your filter: job_boards`), so you can always tell a rule decision from a model decision.
 
 ## Known limitations
 
@@ -139,6 +276,8 @@ The prompt is the real brain here. It's written for a specific person — a stud
 - **First run looks back 2 days only**, capped at 60 messages. The cleanup tool handles everything older.
 - **AppleScript mode needs the Mac awake** and Mail.app running. A sleeping laptop means delayed triage.
 - **Classification is probabilistic.** The overrides exist because it will be wrong sometimes. Read the digest.
+- **The panel is not a running app.** It's a local server you start when you want to change something, not a menu bar item that's always there.
+- **`\Seen` is an imperfect read signal.** Preview panes mark mail read, so unsubscribe candidates may be undercounted. Subscription analysis is IMAP-only.
 
 ## Roadmap
 
@@ -146,6 +285,7 @@ The prompt is the real brain here. It's written for a specific person — a stud
 - Thread awareness
 - Attachment text extraction for assessment links
 - A feedback loop: mark something as misfiled and have it update the allowlist automatically
+- Menu bar app, so the panel is always a click away instead of a command
 
 ## License
 

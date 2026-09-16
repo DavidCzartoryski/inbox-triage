@@ -1,9 +1,13 @@
 """Offline tests. No network, no mail account, no API key required."""
+import json
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import types
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -13,6 +17,8 @@ os.environ.setdefault("MAIL_BACKEND", "applescript")
 import mail_backends as mb  # noqa: E402
 import icloud_triage as t  # noqa: E402
 import inbox_cleanup as c  # noqa: E402
+import settings as st  # noqa: E402
+import subscriptions as sub  # noqa: E402
 
 FS, RS = "\x1e", "\x1d"
 
@@ -152,6 +158,197 @@ def test_cleanup_report_lists_both_actions():
     finally:
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Filter rules
+# ---------------------------------------------------------------------------
+
+def _msg(frm, subject, unsub=False, reply_to=""):
+    return {"uid": "1", "from": frm, "reply_to": reply_to, "subject": subject,
+            "has_unsubscribe": unsub, "body": "", "date": ""}
+
+
+def _cfg(**filters):
+    cfg = st.load_config(path="/nonexistent-on-purpose")
+    cfg["filters"].update(filters)
+    return cfg
+
+
+# The whole safety argument for shipping a no-reply@ toggle at all: it sits
+# below the keyword protections, so it cannot file an assessment invite.
+def test_no_reply_rule_cannot_file_an_assessment():
+    cfg = _cfg(no_reply=True)
+    for subject in ("Complete your online assessment",
+                    "Interview scheduling for Stripe",
+                    "Action required: verification code"):
+        msg = _msg("no-reply@hackerrank.com", subject)
+        assert t.hard_keep(msg) is True, subject
+        # matching_rules would file it, which is exactly why the protection
+        # has to be checked first in run_triage.
+        assert "no_reply" in st.matching_rules(msg, cfg)
+
+    # Mail the protections don't cover is still filed, so the rule does work.
+    assert st.matching_rules(_msg("no-reply@app.example", "Weekly summary"),
+                             cfg) == ["no_reply"]
+
+
+def test_allowlist_beats_every_rule():
+    # Career-services mass mail: carries an unsubscribe header and comes from
+    # a no-reply address, so two enabled rules want to file it. The allowlist
+    # is checked first in run_triage, which is what saves it.
+    cfg = _cfg(bulk_mail=True, no_reply=True)
+    cfg["allowlist"] = ["@northeastern.edu"]
+    msg = _msg("no-reply@northeastern.edu", "Career fair Thursday", unsub=True)
+    assert sorted(st.matching_rules(msg, cfg)) == ["bulk_mail", "no_reply"]
+    assert st.allowlisted(msg, cfg) is True
+
+    # Same mail, not allowlisted: the rules do file it.
+    cfg["allowlist"] = []
+    assert st.allowlisted(msg, cfg) is False
+
+
+def test_job_board_rule_spares_real_recruiter_mail():
+    cfg = _cfg(job_boards=True)
+    digest = _msg("jobs-noreply@linkedin.com", "12 new jobs for you")
+    human = _msg("recruiter@linkedin.com", "Interested in a role at Stripe?")
+    assert "job_boards" in st.matching_rules(digest, cfg)
+    assert st.matching_rules(human, cfg) == []   # match:"both" needs subject too
+
+
+def test_disabled_rules_never_match():
+    msg = _msg("notifications@instructure.com", "Grade posted")
+    assert st.matching_rules(msg, _cfg(lms=True)) == ["lms"]
+    assert st.matching_rules(msg, _cfg(lms=False)) == []
+
+
+def test_bulk_rule_reads_the_unsubscribe_header():
+    cfg = _cfg(bulk_mail=True)
+    assert st.matching_rules(_msg("x@y.example", "Hi", unsub=True), cfg) == ["bulk_mail"]
+    assert st.matching_rules(_msg("x@y.example", "Hi", unsub=False), cfg) == []
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def test_config_roundtrip_and_cadence_lookup():
+    tmp = Path(tempfile.mkdtemp()) / "config.json"
+    try:
+        cfg = st.load_config(path=tmp)          # missing file -> defaults
+        cfg["refresh"] = "8h"
+        cfg["digests_per_day"] = "3"
+        st.save_config(cfg, path=tmp)
+        back = st.load_config(path=tmp)
+        assert st.refresh_minutes(back) == 480
+        assert st.digest_hours(back) == [8, 13, 18]
+    finally:
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+
+
+def test_corrupt_config_falls_back_instead_of_stopping_triage():
+    tmp = Path(tempfile.mkdtemp()) / "config.json"
+    try:
+        tmp.write_text("{not json at all")
+        cfg = st.load_config(path=tmp)
+        assert cfg["refresh"] == st.DEFAULT_CONFIG["refresh"]
+        assert st.refresh_minutes(cfg) == 15
+    finally:
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+
+
+def test_stale_config_cannot_enable_an_unknown_rule():
+    tmp = Path(tempfile.mkdtemp()) / "config.json"
+    try:
+        tmp.write_text(json.dumps(
+            {"filters": {"delete_everything": True, "lms": False}}))
+        cfg = st.load_config(path=tmp)
+        assert "delete_everything" not in cfg["filters"]
+        assert cfg["filters"]["lms"] is False      # known keys still apply
+    finally:
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+
+
+def test_unknown_cadence_ids_fall_back_to_safe_values():
+    assert st.refresh_minutes({"refresh": "every fortnight"}) == 15
+    assert st.digest_hours({"digests_per_day": "99"}) == [8, 18]
+
+
+# ---------------------------------------------------------------------------
+# Subscriptions
+# ---------------------------------------------------------------------------
+
+def test_unsubscribe_target_prefers_mailto_over_tracked_url():
+    header = "<https://track.example/u?id=9>, <mailto:leave@example.com>"
+    assert sub.unsubscribe_target(header) == ("mailto", "leave@example.com")
+    assert sub.unsubscribe_target("<https://track.example/u>") == (
+        "url", "https://track.example/u")
+    assert sub.unsubscribe_target(None) == (None, None)
+    assert sub.unsubscribe_target("garbage") == (None, None)
+
+
+def test_subscription_scoring_ranks_high_volume_never_opened_first():
+    cfg = {"unsubscribe": {"min_messages": 5, "max_read_rate": 0.2}}
+    messages = (
+        # 30 from a sender you never open -> top candidate
+        [{"from": "Alerts <a@jobs.example>", "subject": "jobs", "date": None,
+          "seen": False, "unsub": "<mailto:leave@jobs.example>"}] * 30
+        # 10 from a sender you never open -> also a candidate, ranked lower
+        + [{"from": "Brew <b@news.example>", "subject": "news", "date": None,
+            "seen": False, "unsub": "<https://news.example/u>"}] * 10
+        # 20 you read most of -> not a candidate
+        + [{"from": "Prof <p@univ.edu>", "subject": "class", "date": None,
+            "seen": True, "unsub": "<mailto:x@univ.edu>"}] * 20
+        # high volume but no unsubscribe header -> nothing to act on
+        + [{"from": "ATS <ats@corp.example>", "subject": "app", "date": None,
+            "seen": False, "unsub": None}] * 40
+    )
+    got = sub.analyze(messages, cfg)
+    assert [c["sender"] for c in got] == ["a@jobs.example", "b@news.example"]
+    assert got[0]["count"] == 30 and got[0]["read"] == 0
+
+
+def test_a_sender_below_the_volume_floor_is_not_a_subscription():
+    cfg = {"unsubscribe": {"min_messages": 5, "max_read_rate": 0.2}}
+    messages = [{"from": "x@y.example", "subject": "s", "date": None,
+                 "seen": False, "unsub": "<mailto:l@y.example>"}] * 4
+    assert sub.analyze(messages, cfg) == []
+
+
+# ---------------------------------------------------------------------------
+# Settings panel
+# ---------------------------------------------------------------------------
+
+def test_panel_rejects_requests_without_the_token():
+    """The panel writes config, so an untokened request must not reach it."""
+    import ui_server
+    from http.server import ThreadingHTTPServer
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ui_server.Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def status(path, token=None, host=None):
+        url = f"{base}{path}" + (f"?token={token}" if token else "")
+        req = urllib.request.Request(url)
+        if host:
+            req.add_header("Host", host)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    try:
+        assert status("/api/config") == 403                      # no token
+        assert status("/api/config", token="wrong") == 403        # bad token
+        assert status("/api/config", token=ui_server.TOKEN) == 200
+        # DNS rebinding: right token, but the browser thinks it's elsewhere.
+        assert status("/api/config", token=ui_server.TOKEN,
+                      host="evil.example") == 403
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":

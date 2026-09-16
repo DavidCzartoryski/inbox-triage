@@ -33,6 +33,7 @@ except ImportError:
     sys.exit("Missing dependency. Run: pip install anthropic")
 
 from mail_backends import get_backend, mask
+from settings import allowlisted, load_config, matching_rules
 
 # ---------------------------------------------------------------------------
 # Config
@@ -229,8 +230,36 @@ def run_triage(dry_run=False):
         filed = kept = skipped = 0
         handled, unclassified = [], []
 
-        for i in range(0, len(messages), BATCH_SIZE):
-            batch = messages[i:i + BATCH_SIZE]
+        # Your toggles run first, but only on mail the protections have already
+        # cleared. Anything a rule catches is filed without an API call, which
+        # is both free and predictable.
+        cfg = load_config()
+        to_model = []
+        for msg in messages:
+            protected = allowlisted(msg, cfg) or hard_keep(msg)
+            hits = [] if protected else matching_rules(msg, cfg)
+            if not hits:
+                to_model.append(msg)
+                continue
+            handled.append(msg["uid"])
+            if not dry_run and not backend.move_to_filtered(msg["uid"]):
+                print(f"  move failed, left in inbox: {msg['uid']}",
+                      file=sys.stderr)
+            state["queue"].append({
+                "uid": msg["uid"], "from": msg["from"],
+                "subject": msg["subject"], "date": msg["date"],
+                "category": "NOISE", "importance": 0,
+                "summary": f"your filter: {', '.join(hits)}", "deadline": None,
+            })
+            filed += 1
+            print(f"  [rule    ] {msg['subject'][:52]}  ({hits[0]})")
+
+        if filed:
+            print(f"  {filed} filed by your filters, no API call needed.")
+        messages_for_model = to_model
+
+        for i in range(0, len(messages_for_model), BATCH_SIZE):
+            batch = messages_for_model[i:i + BATCH_SIZE]
             verdicts = classify(client, batch)
 
             for msg in batch:

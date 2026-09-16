@@ -98,7 +98,49 @@ Prints every decision, changes nothing. **Do this for a day or two.** Read the o
 
 When it looks right, drop `--dry-run`.
 
-## 7. Schedule it
+## 7. Pick your filters
+
+```bash
+python src/ui_server.py
+```
+
+Opens a 250×350 panel. Three tabs: **Filters** (what to file), **Timing** (how
+often), **Unsubs** (subscriptions worth leaving). Hit Save and it writes
+`config.json`, which the agent reads on its next run — no restart needed.
+
+Leave **no-reply@ senders** off unless you have a specific reason. Assessment
+invites come from no-reply addresses; the keyword protections are the only
+thing standing between that rule and a filed assessment.
+
+The panel binds `127.0.0.1` and requires a token printed at startup, so the URL
+is single-use per launch. If you want it without a browser window opening:
+
+```bash
+python src/ui_server.py --no-open      # prints the tokenised URL
+```
+
+## 8. Schedule it
+
+The panel's Timing tab records your choice; this applies it:
+
+```bash
+python src/schedule_agent.py install     # writes and loads launchd jobs
+python src/schedule_agent.py status      # what's loaded
+python src/schedule_agent.py uninstall   # remove both jobs
+python src/schedule_agent.py cron        # print cron lines instead
+```
+
+Re-run `install` any time you change the cadence — it rewrites both plists
+from `config.json`. Logs land in `logs/`.
+
+Prefer frequent checks and infrequent digests. You're billed per email
+classified, not per check, so a 15-minute interval costs the same as a
+12-hour one and flags a timed assessment hours sooner. Space out the digest
+instead — that's the part that interrupts you.
+
+### Writing the plists by hand
+
+`schedule_agent.py install` is the easy path. If you'd rather see the plists:
 
 ### macOS (launchd)
 
@@ -175,7 +217,27 @@ Caveats worth knowing before you depend on it:
 - **Your app password sits in GitHub's secret store.** That's reasonable, but it's one more place it exists. If that bothers you, use launchd on your own machine.
 - Make the repo **private** if you go this route.
 
-## 8. Clean out the backlog
+## 9. Find subscriptions worth leaving
+
+```bash
+export MAIL_BACKEND=imap
+python src/subscriptions.py              # scans INBOX + Filtered
+python src/subscriptions.py --days 365   # look back further
+```
+
+Writes `unsubscribe_candidates.json`, which the panel's Unsubs tab displays.
+IMAP only — it needs per-message `\Seen` flags in bulk, which AppleScript
+can't supply at speed.
+
+It lists senders and their unsubscribe links. It does not click them. A
+`mailto:` target is a plain request; a `url` target is a tracked one-click
+endpoint that also confirms your address is live. Which of those you trust is
+your decision, so the tool leaves it to you.
+
+Run the triage agent for a few weeks before relying on this — read rates need
+history to mean anything.
+
+## 10. Clean out the backlog
 
 Once, with the IMAP backend:
 
@@ -197,6 +259,11 @@ Prompts for confirmation, then moves everything marked `ARCHIVE` into `Filtered`
 
 | Symptom | Cause |
 |---|---|
+| Panel says 403 | The token changes every launch. Use the URL the current process printed, not an old one |
+| Panel won't open a small window | No Chromium-family browser found; it falls back to your default browser in a normal tab |
+| Toggles saved but nothing changed | The agent reads `config.json` on its *next* run. Changing the schedule also needs `schedule_agent.py install` |
+| Subscriptions says it needs IMAP | It does — `export MAIL_BACKEND=imap` first |
+| An assessment got filed | Check the digest for `your filter:` — if a rule caught it, turn that toggle off and add the sender to the allowlist. If the model did it, add a `HARD_KEEP_PATTERNS` entry |
 | `osascript` error -1743 | Automation permission denied. System Settings → Privacy & Security → Automation |
 | Mail.app times out | Too many messages for AppleScript. Lower the fetch count or use `MAIL_BACKEND=imap` |
 | IMAP auth fails on iCloud | Try the short username (before the `@`), and confirm you're using an app-specific password |
