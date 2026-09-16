@@ -68,6 +68,20 @@ Electron. It writes `config.json`; the agent reads it on the next run.
 └─────────────────────────────┘
 ```
 
+The **Setup** tab takes your Anthropic API key and writes it to the macOS
+Keychain — not to a file, and never into the source. The panel can set or
+clear it and nothing more: no endpoint returns a stored secret, so the panel's
+token can't be used to read your key back out.
+
+```bash
+.venv/bin/python src/keystore.py set anthropic-api-key    # or do it in the panel
+.venv/bin/python src/keystore.py status                   # where it's coming from
+```
+
+`ANTHROPIC_API_KEY` in the environment still wins, so CI and one-off overrides
+work unchanged. Keys in source files are the one arrangement to avoid: the code
+gets committed, and this repo is public.
+
 It binds `127.0.0.1` only, and every request needs a token minted at startup
 and present just in the URL it opens. Localhost alone wouldn't be enough: any
 page in your browser can make requests to localhost, and the panel rewrites

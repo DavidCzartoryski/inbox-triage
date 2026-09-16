@@ -39,6 +39,7 @@ except ImportError:
         "by Homebrew\nand system Pythons (PEP 668, externally-managed)."
     )
 
+import keystore
 from mail_backends import get_backend, mask
 from settings import allowlisted, load_config, matching_rules
 
@@ -243,7 +244,7 @@ def classify(client, batch):
 def run_triage(dry_run=False):
     state = load_state()
     backend = get_backend()
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(api_key=keystore.api_key())
 
     try:
         if backend.name == "applescript":
@@ -504,12 +505,22 @@ PLACEHOLDERS = {
 def config_problems(require_digest_to=True):
     """Unset or still-placeholder settings, as human-readable strings."""
     problems = []
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not key:
-        problems.append("ANTHROPIC_API_KEY is not set (did you `source .env`?)")
-    elif key in PLACEHOLDERS["ANTHROPIC_API_KEY"] or "..." in key:
-        problems.append("ANTHROPIC_API_KEY is still the example value — "
-                        "get a real one at https://console.anthropic.com")
+    # keystore.api_key() checks the environment first, then the Keychain, and
+    # ignores the shipped placeholder so it can't shadow a real stored key.
+    if not keystore.api_key():
+        raw = os.environ.get("ANTHROPIC_API_KEY", "")
+        if raw and "..." in raw:
+            problems.append(
+                "ANTHROPIC_API_KEY is still the example value. Get a real key "
+                "at https://console.anthropic.com/settings/keys, then either "
+                "store it in the Keychain:\n"
+                "      .venv/bin/python src/keystore.py set anthropic-api-key\n"
+                "    or put it in .env")
+        else:
+            problems.append(
+                "No Anthropic API key found. Store one in the Keychain:\n"
+                "      .venv/bin/python src/keystore.py set anthropic-api-key\n"
+                "    or set ANTHROPIC_API_KEY in .env and `source .env`")
 
     if require_digest_to:
         if not DIGEST_TO:
@@ -545,12 +556,13 @@ def run_test():
 
     problems = config_problems()
     blocking = [p for p in problems if "(warning only)" not in p]
+    sys.stdout.flush()   # else these stderr lines jump ahead of the mail output
     for p in problems:
         print(f"  ! {p}", file=sys.stderr)
     if blocking:
         sys.exit("\nFix the above in .env, then `source .env` again and re-run.")
 
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(api_key=keystore.api_key())
     try:
         client.messages.create(model=MODEL, max_tokens=10,
                                messages=[{"role": "user", "content": "say ok"}])

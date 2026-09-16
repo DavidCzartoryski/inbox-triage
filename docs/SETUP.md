@@ -41,7 +41,32 @@ python tests/test_triage.py
 
 ## 2. Get an API key
 
-From [console.anthropic.com](https://console.anthropic.com). This is billed per use and is separate from a Claude.ai subscription. At normal student mail volume, expect a few cents a day.
+From [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys). Billed per use, separate from a Claude.ai subscription. At normal student mail volume, expect a few cents a day.
+
+**Never paste a key into a source file.** Anything in the code gets committed, and a key pushed to a public repo is compromised the moment it lands. Two safe places, in order of preference:
+
+```bash
+# 1. macOS Keychain — encrypted, can't end up in a diff
+.venv/bin/python src/keystore.py set anthropic-api-key   # prompts, no echo
+
+# or set it in the panel's Setup tab, which writes to the same place
+```
+
+```bash
+# 2. .env — fine, but it's plaintext on disk
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+Check what's stored, without revealing it:
+
+```bash
+.venv/bin/python src/keystore.py status
+.venv/bin/python src/keystore.py delete anthropic-api-key
+```
+
+`ANTHROPIC_API_KEY` in the environment always wins over the Keychain, so CI secrets and one-off overrides keep working. The shipped placeholder `sk-ant-...` is ignored, so a half-edited `.env` can't shadow a working stored key.
+
+If a key ever does reach a commit, rotate it at the console — deleting the line doesn't help, since the value stays in git history.
 
 ## 3. Choose a backend
 

@@ -26,6 +26,7 @@ from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import keystore  # noqa: E402
 from settings import (  # noqa: E402
     DIGEST_CHOICES, REFRESH_CHOICES, RULES, load_config, save_config,
 )
@@ -100,6 +101,13 @@ class Handler(BaseHTTPRequestHandler):
             data = read_json_file("unsubscribe_candidates.json")
             return self._send(200, data or {"candidates": [], "scanned": 0})
 
+        # Deliberately reports only whether each secret is set and where it
+        # came from. There is no endpoint that returns a secret's value, so a
+        # leaked token can't be used to read your API key back out.
+        if url.path == "/api/secrets":
+            return self._send(200, {"secrets": keystore.status(),
+                                    "keychain": keystore.available()})
+
         if url.path == "/api/status":
             state = read_json_file("state.json") or {}
             queue = state.get("queue", [])
@@ -145,6 +153,22 @@ class Handler(BaseHTTPRequestHandler):
                                     if str(s).strip()][:200]
             save_config(cfg)
             return self._send(200, {"ok": True, "config": cfg})
+
+        if url.path == "/api/secrets":
+            name = payload.get("name")
+            if name not in keystore.SECRETS:
+                return self._send(400, {"error": "unknown secret name"})
+            value = payload.get("value") or ""
+            if payload.get("clear"):
+                keystore.delete_secret(name)
+                return self._send(200, {"ok": True, "secrets": keystore.status()})
+            # The value arrives in the request body, never the query string, so
+            # it stays out of browser history and any access log.
+            ok, message = keystore.set_secret(name, value)
+            del value
+            return self._send(200 if ok else 400,
+                              {"ok": ok, "message": message,
+                               "secrets": keystore.status()})
 
         return self._send(404, {"error": "no such path"})
 

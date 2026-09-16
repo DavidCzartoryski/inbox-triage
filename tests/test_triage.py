@@ -17,6 +17,7 @@ os.environ.setdefault("MAIL_BACKEND", "applescript")
 import mail_backends as mb  # noqa: E402
 import icloud_triage as t  # noqa: E402
 import inbox_cleanup as c  # noqa: E402
+import keystore as ks  # noqa: E402
 import settings as st  # noqa: E402
 import subscriptions as sub  # noqa: E402
 
@@ -352,19 +353,33 @@ def test_marketing_cannot_squat_on_protected_words():
 # ---------------------------------------------------------------------------
 
 def test_placeholder_api_key_is_caught_before_any_request():
-    saved = dict(os.environ)
+    saved_env = dict(os.environ)
+    saved_get = ks.get_secret
     try:
+        # Empty Keychain, so the result doesn't depend on the dev's machine.
+        ks.get_secret = lambda name, service=ks.SERVICE: None
+
         os.environ["ANTHROPIC_API_KEY"] = "sk-ant-..."
-        assert any("ANTHROPIC_API_KEY" in p
-                   for p in t.config_problems(require_digest_to=False))
-        os.environ.pop("ANTHROPIC_API_KEY")
-        assert any("not set" in p
-                   for p in t.config_problems(require_digest_to=False))
+        problems = t.config_problems(require_digest_to=False)
+        assert any("still the example value" in p for p in problems)
+
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        problems = t.config_problems(require_digest_to=False)
+        assert any("No Anthropic API key found" in p for p in problems)
+        # Both phrasings must point at how to fix it.
+        assert any("keystore.py set" in p for p in problems)
+
         os.environ["ANTHROPIC_API_KEY"] = "sk-ant-a-real-looking-key"
         assert t.config_problems(require_digest_to=False) == []
+
+        # A key in the Keychain alone is enough — no .env required.
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        ks.get_secret = lambda name, service=ks.SERVICE: "sk-ant-stored"
+        assert t.config_problems(require_digest_to=False) == []
     finally:
+        ks.get_secret = saved_get
         os.environ.clear()
-        os.environ.update(saved)
+        os.environ.update(saved_env)
 
 
 def test_digest_refuses_to_mail_the_example_address():
@@ -392,6 +407,71 @@ def test_digest_refuses_to_mail_the_example_address():
     finally:
         t.STATE_PATH, t.DIGEST_TO = saved_path, saved_to
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Secret storage
+# ---------------------------------------------------------------------------
+
+def test_environment_beats_keychain_but_placeholder_does_not():
+    saved_env = dict(os.environ)
+    saved_get = ks.get_secret
+    try:
+        ks.get_secret = lambda name, service=ks.SERVICE: "from-keychain"
+
+        os.environ["ANTHROPIC_API_KEY"] = "from-env"
+        assert ks.api_key() == "from-env"
+
+        # The shipped placeholder must not shadow a real stored key, or a
+        # half-edited .env silently breaks a working setup.
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-..."
+        assert ks.api_key() == "from-keychain"
+
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        assert ks.api_key() == "from-keychain"
+
+        ks.get_secret = lambda name, service=ks.SERVICE: None
+        assert ks.api_key() is None
+    finally:
+        ks.get_secret = saved_get
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+
+def test_keychain_roundtrip():
+    """Only meaningful on macOS; CI on Linux has no `security` binary."""
+    if not ks.available():
+        return
+    name = "anthropic-api-key"
+    had = ks.get_secret(name)          # don't clobber a real key
+    try:
+        ok, _ = ks.set_secret(name, "test-value-please-ignore")
+        assert ok
+        assert ks.get_secret(name) == "test-value-please-ignore"
+        assert ks.status()[name]["source"] == "keychain"
+        assert ks.delete_secret(name) is True
+        assert ks.get_secret(name) is None
+    finally:
+        if had:
+            ks.set_secret(name, had)
+        else:
+            ks.delete_secret(name)
+
+
+def test_set_secret_rejects_empty_values():
+    ok, msg = ks.set_secret("anthropic-api-key", "   ")
+    assert ok is False and "empty" in msg
+
+
+def test_status_never_exposes_a_value():
+    saved = ks.get_secret
+    try:
+        ks.get_secret = lambda name, service=ks.SERVICE: "super-secret-value"
+        blob = json.dumps(ks.status())
+        assert "super-secret-value" not in blob
+        assert ks.status()["anthropic-api-key"]["set"] is True
+    finally:
+        ks.get_secret = saved
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +505,22 @@ def test_panel_rejects_requests_without_the_token():
         # DNS rebinding: right token, but the browser thinks it's elsewhere.
         assert status("/api/config", token=ui_server.TOKEN,
                       host="evil.example") == 403
+        # The secrets endpoint is the one most worth protecting.
+        assert status("/api/secrets") == 403
+        assert status("/api/secrets", token="wrong") == 403
+        assert status("/api/secrets", token=ui_server.TOKEN) == 200
+
+        # And even authorized, it reports only whether a key is set.
+        saved = ks.get_secret
+        try:
+            ks.get_secret = lambda name, service=ks.SERVICE: "leaked-key-value"
+            url = f"{base}/api/secrets?token={ui_server.TOKEN}"
+            with urllib.request.urlopen(url, timeout=5) as r:
+                body = r.read().decode()
+            assert "leaked-key-value" not in body
+            assert '"set": true' in body
+        finally:
+            ks.get_secret = saved
     finally:
         server.shutdown()
         server.server_close()

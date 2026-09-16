@@ -64,11 +64,20 @@
   .note { color: var(--dim); font-size: 11px; margin: 5px 0 0; }
   .note.danger { color: var(--danger); }
 
-  textarea {
-    width: 100%; height: 58px; resize: vertical; background: var(--card);
+  textarea, input[type="password"] {
+    width: 100%; resize: vertical; background: var(--card);
     color: var(--fg); border: 1px solid var(--line); border-radius: 5px;
     font: 11.5px/1.4 ui-monospace, Menlo, monospace; padding: 5px 6px;
   }
+  textarea { height: 58px; }
+  .btnrow { display: flex; gap: 5px; margin-top: 5px; }
+  button.mini {
+    flex: 1; padding: 5px; font: inherit; font-size: 11.5px; cursor: pointer;
+    border: 1px solid var(--accent); border-radius: 5px;
+    background: var(--accent); color: #fff;
+  }
+  button.mini.ghost { background: none; color: var(--dim); border-color: var(--line); }
+  .ok { color: var(--on); } .bad { color: var(--danger); }
 
   footer {
     flex: 0 0 auto; padding: 8px 11px; border-top: 1px solid var(--line);
@@ -110,6 +119,7 @@
   <button data-tab="filters" class="sel">Filters</button>
   <button data-tab="timing">Timing</button>
   <button data-tab="subs">Unsubs</button>
+  <button data-tab="setup">Setup</button>
 </nav>
 
 <main>
@@ -142,6 +152,25 @@
   <section class="tab" id="tab-subs">
     <h2>Sends a lot, you never open it</h2>
     <div id="subs"><p class="empty">…</p></div>
+  </section>
+
+  <section class="tab" id="tab-setup">
+    <h2>Anthropic API key</h2>
+    <div id="secret-status" class="note">…</div>
+    <input type="password" id="apikey" autocomplete="off" spellcheck="false"
+           placeholder="sk-ant-…">
+    <div class="btnrow">
+      <button id="savekey" class="mini">Store in Keychain</button>
+      <button id="clearkey" class="mini ghost">Remove</button>
+    </div>
+    <p class="note">Goes to the macOS Keychain, not to a file and not into the
+      code. Encrypted at rest, and it can't land in a commit. Nothing here ever
+      reads it back — this panel can only set or clear it.</p>
+    <p class="note">Get one at <a href="https://console.anthropic.com/settings/keys"
+      target="_blank" rel="noreferrer noopener">console.anthropic.com</a>.
+      Billed per use, separate from a Claude subscription.</p>
+    <p class="note"><code>ANTHROPIC_API_KEY</code> in the environment still
+      wins if it's set, so CI and one-off overrides keep working.</p>
   </section>
 </main>
 
@@ -220,7 +249,48 @@ async function load() {
     : `<p class="empty">No report yet. Run:<br><code>python src/subscriptions.py</code>
        <br><br>Needs <code>MAIL_BACKEND=imap</code>. Nothing is unsubscribed for
        you — these are links you click yourself.</p>`;
+
+  await loadSecrets();
 }
+
+async function loadSecrets() {
+  const r = await (await api("/api/secrets")).json();
+  const k = r.secrets["anthropic-api-key"];
+  const el = $("#secret-status");
+  if (k && k.set) {
+    el.innerHTML = `<span class="ok">Key is set</span> (from ${esc(k.source)})`;
+  } else if (!r.keychain) {
+    el.innerHTML = `<span class="bad">No Keychain on this platform.</span>
+      Use <code>ANTHROPIC_API_KEY</code> in <code>.env</code> instead.`;
+  } else {
+    el.innerHTML = `<span class="bad">No key set.</span> The agent can't
+      classify anything until one is stored.`;
+  }
+  $("#savekey").disabled = !r.keychain;
+}
+
+async function sendSecret(body, label) {
+  $("#msg").textContent = "";
+  const res = await api("/api/secrets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(Object.assign({ name: "anthropic-api-key" }, body)),
+  });
+  const data = await res.json().catch(() => ({}));
+  $("#apikey").value = "";                    // don't leave it in the DOM
+  await loadSecrets();
+  $("#msg").textContent = res.ok ? label : (data.message || "Failed");
+  $("#msg").style.color = res.ok ? "var(--on)" : "var(--danger)";
+  setTimeout(() => $("#msg").textContent = "", 2600);
+}
+
+$("#savekey").onclick = () => {
+  const v = $("#apikey").value.trim();
+  if (!v) { $("#msg").textContent = "Paste a key first";
+            $("#msg").style.color = "var(--danger)"; return; }
+  sendSecret({ value: v }, "Key stored");
+};
+$("#clearkey").onclick = () => sendSecret({ clear: true }, "Key removed");
 
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g,

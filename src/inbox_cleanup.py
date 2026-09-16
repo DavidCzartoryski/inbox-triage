@@ -35,6 +35,8 @@ from email.header import decode_header, make_header
 from email.utils import parseaddr
 from pathlib import Path
 
+import keystore
+
 try:
     import anthropic
 except ImportError:
@@ -258,7 +260,7 @@ def classify_senders(client, groups):
 
 def run_scan(limit=None):
     imap = connect()
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(api_key=keystore.api_key())
     try:
         imap.select("INBOX")
         status, data = imap.uid("SEARCH", None, "ALL")
