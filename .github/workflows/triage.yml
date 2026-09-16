@@ -1,0 +1,51 @@
+# Optional: run the agent on GitHub's infrastructure instead of your own
+# machine. Free, but read the caveats in docs/SETUP.md before relying on it —
+# scheduled workflows can be delayed under load, and GitHub disables schedules
+# on repos with no activity for 60 days.
+#
+# Required repository secrets:
+#   ANTHROPIC_API_KEY, MAIL_EMAIL, MAIL_APP_PASSWORD, DIGEST_TO
+
+name: Triage
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"    # triage
+    - cron: "0 12,22 * * *"   # digest (8am and 6pm US Eastern)
+  workflow_dispatch:
+
+concurrency:
+  group: triage
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+
+      # State carries the last-seen UID and the pending digest queue.
+      # restore-keys lets a run pick up the most recent previous state.
+      - uses: actions/cache@v4
+        with:
+          path: state.json
+          key: triage-state-${{ github.run_id }}
+          restore-keys: triage-state-
+
+      - name: Triage or digest
+        env:
+          MAIL_BACKEND: imap
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MAIL_EMAIL: ${{ secrets.MAIL_EMAIL }}
+          MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
+          DIGEST_TO: ${{ secrets.DIGEST_TO }}
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 12,22 * * *" ]; then
+            python src/icloud_triage.py digest
+          else
+            python src/icloud_triage.py triage
+          fi
