@@ -97,8 +97,23 @@ HARD_KEEP_PATTERNS = HARD_KEEP_STRONG + HARD_KEEP_WEAK
 BATCH_SIZE = 8
 BODY_CHARS = 1800
 MAX_MESSAGES_PER_RUN = 60
-# AppleScript walks messages one at a time, so this stays small on purpose.
+# Bodies per run. AppleScript walks messages one at a time, so this stays
+# small on purpose.
 APPLESCRIPT_FETCH = 25
+
+# Ids scanned per run to detect new mail. Measured on a 4,046-message unified
+# inbox, warm:
+#
+#     25 ids           4.1s        25 bodies (old path)   14.8s
+#     50 ids           8.2s        bodies for 3 new        1.8s
+#    150 ids          24.3s        nothing new             0.0s
+#
+# Cost is dominated by indexing into the mailbox, not by reading bodies, so
+# ids are only ~3.7x cheaper per message — not the order of magnitude it looks
+# like. That rules out a wide window: 150 ids would cost more than the 25-body
+# fetch it replaced. 50 keeps an idle run at ~8s (down from ~15s) while
+# covering twice the burst the old code could see.
+APPLESCRIPT_ID_WINDOW = 50
 
 # ---------------------------------------------------------------------------
 # Prompt
@@ -249,11 +264,19 @@ def run_triage(dry_run=False):
     try:
         if backend.name == "applescript":
             # Mail.app exposes no monotonic UID, so dedupe against recent ids.
-            # Keep the fetch small: AppleScript walks messages one at a time.
+            # Two phases: ids are cheap, bodies are not. Scan a wide id window
+            # to notice a burst, then pull bodies for only the newest unseen
+            # batch. Anything left over stays unseen and is picked up next run,
+            # so a burst larger than one batch is delayed, never dropped.
             seen = set(state.get("seen", []))
-            messages = [m for m in backend.fetch_recent(
-                count=APPLESCRIPT_FETCH, body_chars=BODY_CHARS)
-                if m["uid"] not in seen]
+            new_ids = [i for i in backend.fetch_recent_ids(
+                count=APPLESCRIPT_ID_WINDOW) if i not in seen]
+            if len(new_ids) > APPLESCRIPT_FETCH:
+                print(f"{len(new_ids)} new since last run; taking the newest "
+                      f"{APPLESCRIPT_FETCH} now, rest on the next run.")
+            messages = backend.fetch_by_ids(new_ids[:APPLESCRIPT_FETCH],
+                                            body_chars=BODY_CHARS,
+                                            window=APPLESCRIPT_ID_WINDOW)
         else:
             messages = backend.fetch_since(state["last_uid"],
                                            limit=MAX_MESSAGES_PER_RUN,

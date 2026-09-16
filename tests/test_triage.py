@@ -161,6 +161,56 @@ def test_cleanup_report_lists_both_actions():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_fetch_recent_ids_parses_and_skips_blanks():
+    b = mb.AppleScriptBackend()
+    b._run = lambda script: FS.join(["84321", "84322", "", "84323"]) + FS
+    assert b.fetch_recent_ids() == ["84321", "84322", "84323"]
+    b._run = lambda script: ""
+    assert b.fetch_recent_ids() == []
+
+
+def test_fetch_by_ids_is_free_when_nothing_is_new():
+    """An idle run must not talk to Mail.app at all."""
+    b = mb.AppleScriptBackend()
+
+    def boom(script):
+        raise AssertionError("should not have run any AppleScript")
+
+    b._run = boom
+    assert b.fetch_by_ids([]) == []
+
+
+def test_fetch_by_ids_matches_whole_ids_only():
+    """Id 123 must not be matched by the substring inside 1234."""
+    b = mb.AppleScriptBackend()
+    captured = {}
+
+    def fake(script):
+        captured["script"] = script
+        return _record("123", "a@b.example", "", "subj", "Tue", "false", "body")
+
+    b._run = fake
+    msgs = b.fetch_by_ids(["123"])
+    assert msgs[0]["uid"] == "123"
+    # The id list is comma-delimited on both sides, and the comparison adds
+    # commas around each candidate, so 1234 can't satisfy it.
+    assert '","' not in captured["script"].split("set wanted to")[1][:12]
+    assert ",123," in captured["script"]
+    assert '("," & mid & ",")' in captured["script"]
+
+
+def test_fetch_by_ids_rejects_non_numeric_ids():
+    """Ids are interpolated into AppleScript, so they must be integers."""
+    b = mb.AppleScriptBackend()
+    b._run = lambda script: ""
+    for bad in (["1; do shell script \"echo hi\""], ["abc"], ["1 or true"]):
+        try:
+            b.fetch_by_ids(bad)
+            assert False, f"should have rejected {bad!r}"
+        except (ValueError, TypeError):
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Filter rules
 # ---------------------------------------------------------------------------

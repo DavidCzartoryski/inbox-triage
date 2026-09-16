@@ -200,6 +200,38 @@ Messages are fetched with `BODY.PEEK` (IMAP) or read without setting read status
 
 Classification happens in batches of 8 to keep token costs down. Each message contributes roughly 600 tokens. At normal student volume this runs a few cents a day.
 
+## What a run with no new mail costs
+
+Nothing. There's no separate "is there new mail" script to bolt on, because the
+check is the first thing a run does and it short-circuits before any API call:
+
+```
+fetch new mail ──> none? ──> print "No new mail." and exit   (0 tokens)
+               └──> some? ──> your rules ──> model ──> flag or file
+```
+
+Constructing the API client opens no connection, so an idle run is verified at
+**zero API calls**. Two more reasons the bill stays flat:
+
+- **Rules run before the model.** Anything your toggles catch is filed with no
+  API call at all.
+- **You're billed per message classified, not per run.** Ten checks an hour
+  over the same quiet mailbox cost exactly the same as one.
+
+How "new" is determined differs by backend:
+
+| | How it detects new mail | Idle cost |
+|---|---|---|
+| `imap` | Server-side `UID <last+1>:*` search — the server does the work | One cheap IMAP command |
+| `applescript` | Reads the newest 50 message **ids** and diffs against the last 500 seen | ~8s of Apple Events, no bodies read |
+
+Bodies are only ever fetched for messages that are actually new. On a
+4,046-message mailbox that took an idle run from ~15s to ~8s.
+
+If more mail arrives than one batch (25) can handle, the newest 25 are done
+now and the rest stay unseen for the next run — delayed, never dropped. A
+burst of 30 drains as 25 then 5.
+
 ## Two backends
 
 Set `MAIL_BACKEND` to choose how the agent reaches your mail.
@@ -218,13 +250,32 @@ The credential handling and the local/cloud split are adapted from [MrGo2/icloud
 
 ## Provider support
 
-| Provider | Status |
-|---|---|
-| iCloud | Supported, both backends |
-| Gmail | Supported via IMAP (app password, IMAP enabled in settings) |
-| Outlook / Microsoft 365 | **Not supported.** Microsoft requires OAuth2 for IMAP, POP, and SMTP on personal mailboxes; app passwords are refused outright |
+| Provider | `applescript` | `imap` |
+|---|---|---|
+| iCloud | Yes | Yes (app-specific password) |
+| Gmail | Yes | Yes (app password + IMAP enabled) |
+| Outlook / Microsoft 365 / Exchange | **Yes** | No — Microsoft requires OAuth2 and refuses app passwords |
+| Anything else in Mail.app | Yes | Only if it speaks IMAP |
 
-If you're on Outlook, the practical route is forwarding to a Gmail or iCloud address.
+The AppleScript backend works with **any account configured in Mail.app**,
+including Outlook and Exchange. That's the real advantage of driving Mail.app:
+it already holds a valid OAuth session, so the OAuth2 requirement that blocks
+IMAP simply doesn't apply. If you're on a university Microsoft 365 account —
+most US universities are — this is the backend you want.
+
+IMAP remains the only option for a non-Mac host, and the only one for the bulk
+cleanup and subscription analysis.
+
+### Multiple accounts
+
+Mail.app's `inbox` is the **unified** inbox, so the AppleScript backend triages
+every enabled account at once. Filed mail goes to a `Filtered` mailbox *inside
+its own account*, created on first use.
+
+That per-account detail matters more than it sounds. Filing everything into one
+named account would physically move mail between providers — a university
+Exchange message would end up in a personal iCloud account, out of the school
+mailbox entirely, where IT retention and search no longer reach it.
 
 ## Cleaning out the backlog
 

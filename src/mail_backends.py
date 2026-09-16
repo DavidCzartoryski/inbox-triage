@@ -114,6 +114,105 @@ class AppleScriptBackend:
             raise RuntimeError(f"AppleScript failed: {err}")
         return out.stdout
 
+    def fetch_recent_ids(self, count=50):
+        """Just the ids of the newest `count` messages, newest first.
+
+        Cheaper than fetching bodies, but only about 3.7x per message — the
+        expensive part is indexing into the mailbox, not reading content. So
+        this is worth doing (an idle run drops from ~15s to ~8s, and pulls no
+        bodies at all), but the window can't be widened indefinitely: 150 ids
+        cost more than the 25-body fetch this replaced. See the measurements
+        in icloud_triage.APPLESCRIPT_ID_WINDOW.
+        """
+        script = f'''
+        set fs to (ASCII character 30)
+        set output to ""
+        with timeout of {self.timeout} seconds
+          tell application "Mail"
+            set box to inbox
+            set n to count of messages of box
+            if n is 0 then return ""
+            if n > {count} then set n to {count}
+            repeat with i from 1 to n
+              set output to output & (id of message i of box as string) & fs
+            end repeat
+          end tell
+        end timeout
+        return output
+        '''
+        raw = self._run(script)
+        return [p.strip() for p in raw.split(FIELD_SEP) if p.strip()]
+
+    def fetch_by_ids(self, ids, body_chars=1800, window=50):
+        """Full records for specific ids. Reading content does not mark read."""
+        if not ids:
+            return []
+        # Walk only the newest `window` messages, not the whole mailbox: the
+        # ids came from that window, and scanning 4,000 messages to find 25
+        # takes minutes. Stop as soon as everything wanted has been found.
+        #
+        # Ids are wrapped in commas on both sides before matching, so id 123
+        # can't be matched by the substring inside 1234.
+        wanted = "," + ",".join(str(int(i)) for i in ids) + ","
+        script = f'''
+        set fs to (ASCII character 30)
+        set rs to (ASCII character 29)
+        set wanted to "{wanted}"
+        set target to {len(ids)}
+        set found to 0
+        set output to ""
+        with timeout of {self.timeout} seconds
+          tell application "Mail"
+            set box to inbox
+            set n to count of messages of box
+            if n > {window} then set n to {window}
+            repeat with i from 1 to n
+              set m to message i of box
+              set mid to (id of m as string)
+              if wanted contains ("," & mid & ",") then
+                try
+                  set theBody to content of m
+                on error
+                  set theBody to ""
+                end try
+                try
+                  set theReplyTo to reply to of m
+                  if theReplyTo is missing value then set theReplyTo to ""
+                on error
+                  set theReplyTo to ""
+                end try
+                set output to output & mid & fs & ¬
+                  (sender of m) & fs & theReplyTo & fs & (subject of m) & fs & ¬
+                  ((date received of m) as string) & fs & ¬
+                  (read status of m as string) & fs & theBody & rs
+                set found to found + 1
+                if found is greater than or equal to target then exit repeat
+              end if
+            end repeat
+          end tell
+        end timeout
+        return output
+        '''
+        return self._parse_records(self._run(script), body_chars)
+
+    def _parse_records(self, raw, body_chars=1800):
+        messages = []
+        for record in raw.split(RECORD_SEP):
+            parts = record.split(FIELD_SEP)
+            if len(parts) < 7:
+                continue
+            messages.append({
+                "uid": parts[0].strip(),
+                "from": parts[1].strip(),
+                "reply_to": parts[2].strip(),
+                "subject": parts[3].strip(),
+                "date": parts[4].strip(),
+                "read": parts[5].strip().lower() == "true",
+                "body": re.sub(r"\n{3,}", "\n\n", parts[6]).strip()[:body_chars],
+                "has_unsubscribe": False,  # not exposed by AppleScript
+            })
+        return messages
+
     def fetch_recent(self, count=25, body_chars=1800):
         """Newest `count` inbox messages. Reading content does not mark read."""
         script = f'''
@@ -175,13 +274,28 @@ class AppleScriptBackend:
         ''')
 
     def move_to_filtered(self, uid):
+        """File into the Filtered mailbox of the message's OWN account.
+
+        Mail.app's `inbox` is the unified inbox across every configured
+        account. Filing everything into one named account would physically
+        move mail between providers — a university Exchange message would end
+        up inside a personal iCloud account, out of the school mailbox
+        entirely. So resolve the account per message and create Filtered there
+        on first use.
+        """
         script = f'''
         tell application "Mail"
           set m to first message of inbox whose id is {int(uid)}
+          set acct to account of (mailbox of m)
           try
-            set targetBox to mailbox "{self.filtered}" of account "{self.account}"
+            set targetBox to mailbox "{self.filtered}" of acct
           on error
-            set targetBox to mailbox "{self.filtered}"
+            try
+              make new mailbox with properties {{name:"{self.filtered}"}} at acct
+              set targetBox to mailbox "{self.filtered}" of acct
+            on error
+              set targetBox to mailbox "{self.filtered}"
+            end try
           end try
           set mailbox of m to targetBox
         end tell
