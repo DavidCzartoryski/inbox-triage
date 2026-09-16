@@ -28,7 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import keystore  # noqa: E402
 from settings import (  # noqa: E402
-    DIGEST_CHOICES, REFRESH_CHOICES, RULES, load_config, save_config,
+    DIGEST_CHOICES, PREFILTER_CHOICES, REFRESH_CHOICES, RULES,
+    load_config, save_config,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +96,7 @@ class Handler(BaseHTTPRequestHandler):
                           for r in RULES],
                 "refresh_choices": REFRESH_CHOICES,
                 "digest_choices": DIGEST_CHOICES,
+                "prefilter_choices": PREFILTER_CHOICES,
             })
 
         if url.path == "/api/subscriptions":
@@ -148,6 +150,8 @@ class Handler(BaseHTTPRequestHandler):
                 cfg["refresh"] = payload["refresh"]
             if str(payload.get("digests_per_day")) in {c["id"] for c in DIGEST_CHOICES}:
                 cfg["digests_per_day"] = str(payload["digests_per_day"])
+            if payload.get("prefilter") in {c["id"] for c in PREFILTER_CHOICES}:
+                cfg["prefilter"] = payload["prefilter"]
             if isinstance(payload.get("allowlist"), list):
                 cfg["allowlist"] = [str(s).strip() for s in payload["allowlist"]
                                     if str(s).strip()][:200]

@@ -124,6 +124,10 @@
 
 <main>
   <section class="tab sel" id="tab-filters">
+    <h2>Who decides</h2>
+    <select id="prefilter"></select>
+    <p class="note" id="prefilter-note"></p>
+
     <h2>File these out of my inbox</h2>
     <div id="rules"></div>
 
@@ -183,7 +187,7 @@
 const TOKEN = "__TOKEN__";
 const api = (p, opt) => fetch(p + (p.includes("?") ? "&" : "?") + "token=" + TOKEN, opt);
 const $ = s => document.querySelector(s);
-let CFG = null, REFRESH = [];
+let CFG = null, REFRESH = [], PREFILTER = [];
 
 document.querySelectorAll("nav button").forEach(b => {
   b.onclick = () => {
@@ -193,6 +197,14 @@ document.querySelectorAll("nav button").forEach(b => {
     $("#tab-" + b.dataset.tab).classList.add("sel");
   };
 });
+
+function prefilterNote() {
+  const c = PREFILTER.find(c => c.id === $("#prefilter").value);
+  const el = $("#prefilter-note");
+  el.textContent = c ? c.note : "";
+  // "off" is a cost decision, not a mistake; only flag the risky one.
+  el.className = "note" + (c && c.id === "aggressive" ? " danger" : "");
+}
 
 function refreshNote() {
   const c = REFRESH.find(c => c.id === $("#refresh").value);
@@ -214,6 +226,13 @@ async function load() {
       <span class="txt"><span class="lab">${rule.label}</span>
       <span class="hint">${rule.hint}</span></span></label>`;
   }).join("");
+
+  PREFILTER = r.prefilter_choices;
+  $("#prefilter").innerHTML = PREFILTER.map(c =>
+    `<option value="${c.id}" ${c.id === CFG.prefilter ? "selected" : ""}>${c.label}</option>`
+  ).join("");
+  $("#prefilter").onchange = prefilterNote;
+  prefilterNote();
 
   $("#refresh").innerHTML = REFRESH.map(c =>
     `<option value="${c.id}" ${c.id === CFG.refresh ? "selected" : ""}>${c.label}</option>`
@@ -306,6 +325,7 @@ $("#save").onclick = async () => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       filters,
+      prefilter: $("#prefilter").value,
       refresh: $("#refresh").value,
       digests_per_day: $("#digest").value,
       allowlist: $("#allowlist").value.split("\n").map(s => s.trim()).filter(Boolean),

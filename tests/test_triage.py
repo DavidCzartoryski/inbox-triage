@@ -558,6 +558,52 @@ def test_cache_key_separates_subjects_from_the_same_sender():
     assert c == d
 
 
+def test_prefilter_can_be_turned_off_so_the_model_reads_everything():
+    """Some people would rather pay than risk a heuristic filing something."""
+    msg = _hdr("newsdigest@insideapple.apple.com", "Morning roundup", BULK_HEADERS)
+    assert pf.decide(msg, threshold=5).action == "file"
+    d = pf.decide(msg, threshold=None)
+    assert d.action == "ask" and "prefilter_off" in d.reasons
+
+
+def test_prefilter_off_still_honours_protections():
+    """Off means no scored guessing — not no protections."""
+    msg = _hdr("no-reply@ats.example", "Complete your assessment", BULK_HEADERS)
+    assert pf.decide(msg, threshold=None).action == "keep"
+
+
+def test_lower_threshold_files_more():
+    # Scores 4: bulk infra only, no sender or subject signal.
+    msg = _hdr("hello@company.example", "Some announcement",
+               "List-Unsubscribe: <https://x/u>\r\nFeedback-ID: a:b:c\r\n")
+    noise, human, _ = pf.score_headers(msg)
+    assert noise == 5 and human == 0
+    assert pf.decide(msg, threshold=5).action == "file"
+    assert pf.decide(msg, threshold=6).action == "ask"
+    assert pf.decide(msg, threshold=4).action == "file"
+
+
+def test_prefilter_mode_maps_to_a_threshold():
+    assert st.prefilter_threshold({"prefilter": "off"}) is None
+    assert st.prefilter_threshold({"prefilter": "balanced"}) == 5
+    assert st.prefilter_threshold({"prefilter": "aggressive"}) == 4
+    # An unknown mode must not disable filing silently or wildly change it.
+    assert st.prefilter_threshold({"prefilter": "who knows"}) == 5
+    assert st.prefilter_threshold({}) == 5
+
+
+def test_panel_rejects_an_unknown_prefilter_mode():
+    """The panel writes config; a bad value must not reach it."""
+    tmp = Path(tempfile.mkdtemp()) / "config.json"
+    try:
+        cfg = st.load_config(path=tmp)
+        assert cfg["prefilter"] == "balanced"
+        valid = {c["id"] for c in st.PREFILTER_CHOICES}
+        assert "nonsense" not in valid and "off" in valid
+    finally:
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Verdict cache
 # ---------------------------------------------------------------------------

@@ -47,6 +47,28 @@ REFRESH_CHOICES = [
      "note": "An assessment can sit unflagged for up to 12 hours."},
 ]
 
+# How much of the work the non-AI layer is allowed to do. This is a real
+# tradeoff and not ours to decide for someone: reading everything with the
+# model is more accurate and costs more, and some people would rather pay than
+# risk a heuristic filing something.
+#
+# "off" does not disable the protections or your own toggles — those are yours
+# and cost nothing. It disables only the scored guessing.
+PREFILTER_CHOICES = [
+    {"id": "off", "threshold": None,
+     "label": "AI reads every email",
+     "note": "Most accurate, most expensive. Every message that isn't caught "
+             "by your own toggles gets its body read and sent to the model."},
+    {"id": "balanced", "threshold": 5,
+     "label": "Skip the obvious bulk (recommended)",
+     "note": "Files mail carrying unsubscribe and campaign headers without "
+             "asking the model. On a real inbox this cut tokens ~92%."},
+    {"id": "aggressive", "threshold": 4,
+     "label": "Skip more, pay less",
+     "note": "Lower bar for filing. Cheaper and faster, and more likely to "
+             "file something you'd have wanted to see."},
+]
+
 DIGEST_CHOICES = [
     {"id": "1", "label": "Once a day", "hours": [8]},
     {"id": "2", "label": "Twice a day", "hours": [8, 18]},
@@ -151,6 +173,7 @@ RULES = [
 
 DEFAULT_CONFIG = {
     "refresh": "15m",
+    "prefilter": "balanced",
     "digests_per_day": "3",
     "filters": {r["id"]: r["default"] for r in RULES},
     "allowlist": [],
@@ -201,6 +224,15 @@ def refresh_minutes(cfg):
         if c["id"] == choice:
             return c["minutes"]
     return 15
+
+
+def prefilter_threshold(cfg):
+    """Score needed to file without the model, or None when the layer is off."""
+    choice = cfg.get("prefilter", "balanced")
+    for c in PREFILTER_CHOICES:
+        if c["id"] == choice:
+            return c["threshold"]
+    return 5
 
 
 def digest_hours(cfg):

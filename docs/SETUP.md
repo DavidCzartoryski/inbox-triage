@@ -152,9 +152,27 @@ When it looks right, drop `--dry-run`.
 python src/ui_server.py
 ```
 
-Opens a 250×350 panel. Three tabs: **Filters** (what to file), **Timing** (how
-often), **Unsubs** (subscriptions worth leaving). Hit Save and it writes
-`config.json`, which the agent reads on its next run — no restart needed.
+Opens a 250×350 panel. Four tabs: **Filters** (who decides, and what to file),
+**Timing** (how often), **Unsubs** (subscriptions worth leaving), **Setup**
+(your API key). Hit Save and it writes `config.json`, which the agent reads on
+its next run — no restart needed.
+
+### Who decides
+
+The first dropdown on the Filters tab is the cost/accuracy trade:
+
+| Setting | What happens |
+|---|---|
+| **AI reads every email** | Every message not caught by your own toggles gets its body read and sent to the model. Most accurate, most expensive. |
+| **Skip the obvious bulk** *(default)* | Mail carrying unsubscribe and campaign headers is filed without asking the model. Cut tokens ~92% on a real inbox. |
+| **Skip more, pay less** | Files on weaker evidence. Cheaper, and likelier to file something you wanted. |
+
+Turning it off disables only the scored guessing. Your allowlist, your toggles
+and the keyword protections still run — those cost nothing and are yours.
+
+If you're unsure, start with **AI reads every email** for a week, read the
+digests, then switch to the default once you trust what it's doing. The
+difference in spend at student mail volume is cents either way.
 
 Leave **no-reply@ senders** off unless you have a specific reason. Assessment
 invites come from no-reply addresses; the keyword protections are the only

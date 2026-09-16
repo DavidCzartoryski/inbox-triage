@@ -200,6 +200,77 @@ Messages are fetched with `BODY.PEEK` (IMAP) or read without setting read status
 
 Classification happens in batches of 8 to keep token costs down. Each message contributes roughly 600 tokens. At normal student volume this runs a few cents a day.
 
+## Performance
+
+Every number here is measured on one real mailbox — 4,046 messages across an
+iCloud and an Exchange account, AppleScript backend, macOS. "v1" is the first
+working version; "now" is `main`. Nothing is extrapolated, and the method is
+in [`tools/`](tools/) so you can disagree with it.
+
+### Latency
+
+| | v1 | now | |
+|---|---|---|---|
+| Run with no new mail | 18.7s | **9.0s** | ~2× faster |
+| Bodies read on an idle run | 25 | **0** | |
+
+Medians over 9 alternating rounds (`tools/bench_pipeline.py`). v1 ranged
+15.2–19.4s, the current path 8.6–9.1s. At a 15-minute interval that's **~15
+minutes a day** of Apple Events that no longer happen.
+
+Be sceptical of any single sample here. One early round measured the new path
+at **1.3s**, which would look like a 7.8× win — it was a hot Mail.app id cache
+and did not reproduce across the next 9 rounds. ~2× is the honest figure. The
+part that doesn't vary is the invariant underneath it: an idle run now reads
+zero message bodies, where v1 read 25 every time.
+
+Most of the remaining 9s is Mail.app indexing 50 messages to hand back their
+ids — cost that scales with `APPLESCRIPT_ID_WINDOW`, not with how much new
+mail there is. The IMAP backend has no equivalent cost, since the server does
+the search.
+
+### Cost, per 25 new messages
+
+| | v1 | now | |
+|---|---|---|---|
+| Bodies read | 25 | **2** | |
+| Messages sent to the model | 25 | **2** | 8% |
+| Tokens | ~15,000 | **~1,200** | −92% |
+| API calls | 4 | **1** | |
+| Run with no new mail | 1 call | **0 calls** | |
+
+Deliberately in tokens rather than dollars: per-token pricing changes, and a
+README with stale prices is worse than one with none. The shape is what
+matters — the model now sees the 8% of mail that actually needs judgment.
+
+The 92% is not free accuracy. It's a tradeoff, and it's yours to make in the
+panel's **Who decides** dropdown: *AI reads every email* spends more for the
+most accurate result, *Skip the obvious bulk* is the default, *Skip more, pay
+less* files on weaker evidence. Turning it off disables only the scored
+guessing — your allowlist, your toggles and the keyword protections still run,
+because those cost nothing.
+
+### Correctness
+
+Less quotable than the timings, and more important.
+
+| | v1 | now |
+|---|---|---|
+| First real run | **crashed** (`KeyError: 'reply_to'`) | works |
+| Burst larger than one batch | surplus dropped, permanently invisible | delayed, drains across runs |
+| Multi-account filing | school mail moved into a personal account | filed inside its own account |
+| API outage | mail marked processed, never triaged again | retried next run |
+| "Limited-time college offer" | kept in inbox as a job offer | filed as marketing |
+| Outlook / Exchange | documented unsupported | works on the AppleScript backend |
+| Secrets | `.env` in plaintext, `.gitignore` missing entirely | macOS Keychain, never returned by any endpoint |
+| Tests | 8 | **57** |
+
+The v1 crash is the one worth dwelling on: its 8 tests passed because their
+fixtures hand-built message dicts containing a `reply_to` key that neither
+mail backend actually set. Green tests, and it died on the first real email.
+Backends are now driven through their real parsers in tests, so that class of
+bug fails the suite instead of the inbox.
+
 ## The model is the last resort, not the first
 
 Most mail is obvious from the envelope. A message from `newsdigest@` carrying

@@ -43,7 +43,8 @@ import keystore
 import prefilter
 import protections
 from mail_backends import get_backend, mask
-from settings import allowlisted, load_config, matching_rules
+from settings import (allowlisted, load_config, matching_rules,
+                      prefilter_threshold)
 from verdict_cache import VerdictCache
 
 # ---------------------------------------------------------------------------
@@ -286,6 +287,9 @@ def run_triage(dry_run=False):
 
         cfg = load_config()
         cache = VerdictCache(CACHE_PATH)
+        threshold = prefilter_threshold(cfg)
+        if threshold is None:
+            print("  prefilter off — the model will read every message.")
 
         # Headers-only triage, cheapest test first. Nothing below reads a
         # message body, and nothing below costs a token.
@@ -313,7 +317,8 @@ def run_triage(dry_run=False):
                 continue
 
             verdict = prefilter.decide(msg, protected=protected,
-                                       cached=cache.get(key))
+                                       cached=cache.get(key),
+                                       threshold=threshold)
 
             if verdict.action == "file":
                 handled.append(msg["uid"])

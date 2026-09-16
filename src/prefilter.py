@@ -272,12 +272,15 @@ def score_headers(msg):
     return noise, human, reasons
 
 
-def decide(msg, protected=False, cached=None):
+def decide(msg, protected=False, cached=None, threshold=FILE_THRESHOLD):
     """What to do with this message, from headers alone.
 
     `protected` is the caller's allowlist/keyword verdict. It short-circuits
     everything: this layer is not allowed to overrule the protections.
     `cached` is a prior verdict for the same (sender, subject template).
+    `threshold` is None when the user has chosen to have the model read
+    everything — protections, toggles and remembered verdicts still apply,
+    since those are free, but nothing is filed on a score alone.
     """
     # Checked here, not just by the caller. This layer files mail without ever
     # reading a body, so it has to own the guarantee itself rather than trust
@@ -300,14 +303,18 @@ def decide(msg, protected=False, cached=None):
             return Decision("file", 0.95, ["cached_noise"] + reasons,
                             noise, human)
 
-    if human >= HUMAN_VETO and noise < FILE_THRESHOLD + 3:
+    if threshold is None:
+        # Scoring is off by choice: send everything left to the model.
+        return Decision("ask", 0.0, ["prefilter_off"] + reasons, noise, human)
+
+    if human >= HUMAN_VETO and noise < threshold + 3:
         # Looks like a person wrote it. Cheap to be wrong, so ask.
         return Decision("ask", 0.4, reasons, noise, human)
 
-    if noise >= FILE_THRESHOLD and human < HUMAN_VETO:
+    if noise >= threshold and human < HUMAN_VETO:
         # Confidence grows with evidence but never reaches 1.0 without the
         # model; 0.75-0.95 keeps the reporting honest.
-        confidence = min(0.95, 0.75 + 0.04 * (noise - FILE_THRESHOLD))
+        confidence = min(0.95, 0.75 + 0.04 * (noise - threshold))
         return Decision("file", confidence, reasons, noise, human)
 
     return Decision("ask", 0.5 if noise or human else 0.3, reasons, noise, human)
