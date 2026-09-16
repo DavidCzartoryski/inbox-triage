@@ -437,6 +437,14 @@ def run_digest():
         print("Nothing queued; no digest sent.")
         return
 
+    # Check before sending, not after. The digest lists real subject lines and
+    # senders, so mailing it to a leftover example address is a disclosure, and
+    # unlike a bad filter decision it can't be walked back.
+    if not DIGEST_TO or DIGEST_TO in PLACEHOLDERS["DIGEST_TO"]:
+        sys.exit(f"Refusing to send: DIGEST_TO is {DIGEST_TO or 'unset'!r}. "
+                 "The digest contains your subject lines and senders. Set "
+                 "DIGEST_TO to your own address in .env.")
+
     subject, html_body = build_digest(state["queue"])
     plain_body = build_plain_digest(state["queue"])
 
@@ -451,6 +459,41 @@ def run_digest():
     state["last_digest"] = datetime.now(timezone.utc).isoformat()
     save_state(state)
     print(f"Digest sent to {DIGEST_TO}: {subject}")
+
+
+# The values shipped in .env.example. Left in place they don't just fail —
+# DIGEST_TO would mail a stranger a list of your subject lines.
+PLACEHOLDERS = {
+    "ANTHROPIC_API_KEY": ("sk-ant-...",),
+    "DIGEST_TO": ("you@icloud.com",),
+    "MAIL_EMAIL": ("you@icloud.com",),
+    "NEVER_FILTER": ("@youruniversity.edu,advisor@,recruiting@",),
+}
+
+
+def config_problems(require_digest_to=True):
+    """Unset or still-placeholder settings, as human-readable strings."""
+    problems = []
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        problems.append("ANTHROPIC_API_KEY is not set (did you `source .env`?)")
+    elif key in PLACEHOLDERS["ANTHROPIC_API_KEY"] or "..." in key:
+        problems.append("ANTHROPIC_API_KEY is still the example value — "
+                        "get a real one at https://console.anthropic.com")
+
+    if require_digest_to:
+        if not DIGEST_TO:
+            problems.append("DIGEST_TO is not set")
+        elif DIGEST_TO in PLACEHOLDERS["DIGEST_TO"]:
+            problems.append(f"DIGEST_TO is still {DIGEST_TO!r}, which is "
+                            "someone else's address — set it to yours before "
+                            "any digest goes out")
+
+    never = os.environ.get("NEVER_FILTER", "")
+    if never in PLACEHOLDERS["NEVER_FILTER"]:
+        problems.append("NEVER_FILTER is still the example value — put your "
+                        "own school domain in it (warning only)")
+    return problems
 
 
 def run_test():
@@ -470,11 +513,28 @@ def run_test():
     finally:
         backend.close()
 
+    problems = config_problems()
+    blocking = [p for p in problems if "(warning only)" not in p]
+    for p in problems:
+        print(f"  ! {p}", file=sys.stderr)
+    if blocking:
+        sys.exit("\nFix the above in .env, then `source .env` again and re-run.")
+
     client = anthropic.Anthropic()
-    client.messages.create(model=MODEL, max_tokens=10,
-                           messages=[{"role": "user", "content": "say ok"}])
+    try:
+        client.messages.create(model=MODEL, max_tokens=10,
+                               messages=[{"role": "user", "content": "say ok"}])
+    except anthropic.AuthenticationError:
+        # A 20-line traceback for "the key is wrong" teaches nothing.
+        sys.exit("Anthropic API rejected the key (401).\n"
+                 "  - Check for a copied newline or a trailing character\n"
+                 "  - Confirm the key is active at "
+                 "https://console.anthropic.com/settings/keys\n"
+                 "  - Confirm the workspace has credit")
+    except anthropic.APIConnectionError as exc:
+        sys.exit(f"Couldn't reach the Anthropic API: {exc}")
     print(f"Anthropic API OK (model: {MODEL})")
-    print("\nReady. Next: python src/icloud_triage.py triage --dry-run")
+    print("\nReady. Next: .venv/bin/python src/icloud_triage.py triage --dry-run")
 
 
 def main():

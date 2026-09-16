@@ -316,6 +316,53 @@ def test_a_sender_below_the_volume_floor_is_not_a_subscription():
 
 
 # ---------------------------------------------------------------------------
+# Placeholder guards
+# ---------------------------------------------------------------------------
+
+def test_placeholder_api_key_is_caught_before_any_request():
+    saved = dict(os.environ)
+    try:
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-..."
+        assert any("ANTHROPIC_API_KEY" in p
+                   for p in t.config_problems(require_digest_to=False))
+        os.environ.pop("ANTHROPIC_API_KEY")
+        assert any("not set" in p
+                   for p in t.config_problems(require_digest_to=False))
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-a-real-looking-key"
+        assert t.config_problems(require_digest_to=False) == []
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def test_digest_refuses_to_mail_the_example_address():
+    """The digest carries real subject lines; a wrong recipient can't be undone."""
+    tmp = Path(tempfile.mkdtemp())
+    saved_path, saved_to = t.STATE_PATH, t.DIGEST_TO
+    try:
+        t.STATE_PATH = tmp / "state.json"
+        t.STATE_PATH.write_text(json.dumps({
+            "last_uid": 0, "seen": [], "last_digest": None,
+            "queue": [{"uid": "1", "from": "recruiter@corp.example",
+                       "subject": "Assessment for Stripe", "date": "",
+                       "category": "ACTION_REQUIRED", "importance": 99,
+                       "summary": "", "deadline": None}]}))
+        for bad in ("you@icloud.com", ""):
+            t.DIGEST_TO = bad
+            try:
+                t.run_digest()
+                assert False, f"should have refused to send to {bad!r}"
+            except SystemExit as exc:
+                assert "Refusing to send" in str(exc)
+        # The queue must survive the refusal, or the mail is lost silently.
+        state = json.loads(t.STATE_PATH.read_text())
+        assert len(state["queue"]) == 1
+    finally:
+        t.STATE_PATH, t.DIGEST_TO = saved_path, saved_to
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # Settings panel
 # ---------------------------------------------------------------------------
 
