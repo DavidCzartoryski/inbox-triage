@@ -158,9 +158,14 @@ launchctl load ~/Library/LaunchAgents/com.triage.digest.plist
 
 ### GitHub Actions (no server)
 
-`.github/workflows/triage.yml` is included but runs only if you add these repository secrets under Settings → Secrets and variables → Actions:
+`.github/workflows/triage.yml` is included, with its schedule **commented out**. Enable it in this order:
 
-`ANTHROPIC_API_KEY`, `MAIL_EMAIL`, `MAIL_APP_PASSWORD`, `DIGEST_TO`
+1. Add these repository secrets under Settings → Secrets and variables → Actions:
+   `ANTHROPIC_API_KEY`, `MAIL_EMAIL`, `MAIL_APP_PASSWORD`, `DIGEST_TO`
+2. Run it once by hand from the Actions tab (`workflow_dispatch`) and confirm it succeeds.
+3. Uncomment the two `cron` lines in `triage.yml`.
+
+Don't uncomment the schedule first. Without the secrets it runs every 15 minutes, exits immediately, and emails you a failure notice each time — 96 a day.
 
 Caveats worth knowing before you depend on it:
 

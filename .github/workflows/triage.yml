@@ -5,13 +5,18 @@
 #
 # Required repository secrets:
 #   ANTHROPIC_API_KEY, MAIL_EMAIL, MAIL_APP_PASSWORD, DIGEST_TO
+#
+# The schedule is commented out on purpose. Enabled on a fresh clone it runs
+# every 15 minutes, exits immediately because no secrets are set, and mails you
+# a failure notice each time — 96 a day. Set the four secrets above first, run
+# it once by hand from the Actions tab, then uncomment the two cron lines.
 
 name: Triage
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"    # triage
-    - cron: "0 12,22 * * *"   # digest (8am and 6pm US Eastern)
+  # schedule:
+  #   - cron: "*/15 * * * *"    # triage
+  #   - cron: "0 12,22 * * *"   # digest (8am and 6pm US Eastern)
   workflow_dispatch:
 
 concurrency:
