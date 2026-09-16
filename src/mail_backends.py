@@ -133,8 +133,14 @@ class AppleScriptBackend:
               on error
                 set theBody to ""
               end try
+              try
+                set theReplyTo to reply to of m
+                if theReplyTo is missing value then set theReplyTo to ""
+              on error
+                set theReplyTo to ""
+              end try
               set output to output & (id of m as string) & fs & ¬
-                (sender of m) & fs & (subject of m) & fs & ¬
+                (sender of m) & fs & theReplyTo & fs & (subject of m) & fs & ¬
                 ((date received of m) as string) & fs & ¬
                 (read status of m as string) & fs & theBody & rs
             end repeat
@@ -146,15 +152,16 @@ class AppleScriptBackend:
         messages = []
         for record in raw.split(RECORD_SEP):
             parts = record.split(FIELD_SEP)
-            if len(parts) < 6:
+            if len(parts) < 7:
                 continue
             messages.append({
                 "uid": parts[0].strip(),
                 "from": parts[1].strip(),
-                "subject": parts[2].strip(),
-                "date": parts[3].strip(),
-                "read": parts[4].strip().lower() == "true",
-                "body": re.sub(r"\n{3,}", "\n\n", parts[5]).strip()[:body_chars],
+                "reply_to": parts[2].strip(),
+                "subject": parts[3].strip(),
+                "date": parts[4].strip(),
+                "read": parts[5].strip().lower() == "true",
+                "body": re.sub(r"\n{3,}", "\n\n", parts[6]).strip()[:body_chars],
                 "has_unsubscribe": False,  # not exposed by AppleScript
             })
         return messages
@@ -262,6 +269,7 @@ class IMAPBackend:
             out.append({
                 "uid": str(uid),
                 "from": self._decode(msg.get("From")),
+                "reply_to": self._decode(msg.get("Reply-To")),
                 "subject": self._decode(msg.get("Subject")),
                 "date": self._decode(msg.get("Date")),
                 "has_unsubscribe": bool(msg.get("List-Unsubscribe")),

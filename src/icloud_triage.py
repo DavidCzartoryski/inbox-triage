@@ -18,16 +18,13 @@ where it was. Nothing is ever deleted.
 """
 
 import argparse
-import email
-import email.utils
 import html
 import json
 import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta, timezone
-from email.header import decode_header, make_header
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -68,6 +65,8 @@ HARD_KEEP_PATTERNS = [
 BATCH_SIZE = 8
 BODY_CHARS = 1800
 MAX_MESSAGES_PER_RUN = 60
+# AppleScript walks messages one at a time, so this stays small on purpose.
+APPLESCRIPT_FETCH = 25
 
 # ---------------------------------------------------------------------------
 # Prompt
@@ -138,74 +137,41 @@ def save_state(state):
 
 
 # ---------------------------------------------------------------------------
-# IMAP helpers
-# ---------------------------------------------------------------------------
-
-
-def decode_str(value):
-    if not value:
-        return ""
-    try:
-        return str(make_header(decode_header(value)))
-    except Exception:
-        return value
-
-
-def get_body(msg):
-    """Plain text preferred; fall back to a crude HTML strip."""
-    text = ""
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            disp = str(part.get("Content-Disposition") or "")
-            if "attachment" in disp:
-                continue
-            if ctype == "text/plain":
-                text = part.get_payload(decode=True) or b""
-                text = text.decode(part.get_content_charset() or "utf-8", "replace")
-                break
-            if ctype == "text/html" and not text:
-                raw = part.get_payload(decode=True) or b""
-                raw = raw.decode(part.get_content_charset() or "utf-8", "replace")
-                text = strip_html(raw)
-    else:
-        raw = msg.get_payload(decode=True) or b""
-        raw = raw.decode(msg.get_content_charset() or "utf-8", "replace")
-        text = strip_html(raw) if msg.get_content_type() == "text/html" else raw
-
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text.strip()[:BODY_CHARS]
-
-
-def strip_html(raw):
-    raw = re.sub(r"(?is)<(script|style).*?</\1>", " ", raw)
-    raw = re.sub(r"(?i)<br\s*/?>|</p>", "\n", raw)
-    raw = re.sub(r"<[^>]+>", " ", raw)
-    return html.unescape(raw)
-
-
-# ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
 
 
+def next_last_uid(current, seen_uids, unclassified):
+    """Highest UID safe to mark as processed.
+
+    Never advances past a message we failed to classify, so an API outage is
+    retried on the next run instead of being silently skipped forever. Never
+    moves backwards either, or a single bad batch would re-triage the mailbox.
+    """
+    highest = max(int(u) for u in seen_uids)
+    if unclassified:
+        highest = min(highest, min(int(u) for u in unclassified) - 1)
+    return max(int(current or 0), highest)
+
+
 def hard_keep(msg):
-    sender = f"{msg['from']} {msg['reply_to']}".lower()
+    # .get throughout: a backend that can't supply a field must not be able to
+    # crash triage, because a crash means nothing gets triaged at all.
+    sender = f"{msg.get('from', '')} {msg.get('reply_to', '')}".lower()
     if any(s in sender for s in NEVER_FILTER):
         return True
-    subject = msg["subject"].lower()
+    subject = msg.get("subject", "").lower()
     return any(re.search(p, subject) for p in HARD_KEEP_PATTERNS)
 
 
 def render_for_model(msg):
     return (
-        f"UID: {msg['uid']}\n"
-        f"From: {msg['from']}\n"
-        f"Reply-To: {msg['reply_to'] or '(none)'}\n"
-        f"Subject: {msg['subject']}\n"
-        f"Bulk mail headers: {'yes' if msg['has_unsubscribe'] else 'no'}\n"
-        f"Body:\n{msg['body'] or '(empty)'}\n"
+        f"UID: {msg.get('uid', '')}\n"
+        f"From: {msg.get('from', '(unknown)')}\n"
+        f"Reply-To: {msg.get('reply_to') or '(none)'}\n"
+        f"Subject: {msg.get('subject', '(no subject)')}\n"
+        f"Bulk mail headers: {'yes' if msg.get('has_unsubscribe') else 'no'}\n"
+        f"Body:\n{msg.get('body') or '(empty)'}\n"
     )
 
 
@@ -246,10 +212,13 @@ def run_triage(dry_run=False):
             # Mail.app exposes no monotonic UID, so dedupe against recent ids.
             # Keep the fetch small: AppleScript walks messages one at a time.
             seen = set(state.get("seen", []))
-            messages = [m for m in backend.fetch_recent(count=25)
-                        if m["uid"] not in seen]
+            messages = [m for m in backend.fetch_recent(
+                count=APPLESCRIPT_FETCH, body_chars=BODY_CHARS)
+                if m["uid"] not in seen]
         else:
-            messages = backend.fetch_since(state["last_uid"])
+            messages = backend.fetch_since(state["last_uid"],
+                                           limit=MAX_MESSAGES_PER_RUN,
+                                           body_chars=BODY_CHARS)
 
         if not messages:
             print("No new mail.")
@@ -258,6 +227,7 @@ def run_triage(dry_run=False):
         print(f"Fetched {len(messages)} new message(s) via {backend.name}.")
 
         filed = kept = skipped = 0
+        handled, unclassified = [], []
 
         for i in range(0, len(messages), BATCH_SIZE):
             batch = messages[i:i + BATCH_SIZE]
@@ -268,7 +238,10 @@ def run_triage(dry_run=False):
                 if not v:
                     print(f"  [inbox   ] {msg['subject'][:60]}  (unclassified)")
                     skipped += 1
+                    unclassified.append(msg["uid"])
                     continue
+
+                handled.append(msg["uid"])
 
                 category = v.get("category", "FYI")
                 if hard_keep(msg) and category == "NOISE":
@@ -302,11 +275,17 @@ def run_triage(dry_run=False):
                     label = "filed-fyi" if category == "FYI" else "filed    "
                     print(f"  [{label}] {msg['subject'][:60]}")
 
+        # Only remember what we actually classified. An API outage leaves the
+        # mail in the inbox, and the next run must pick it up again rather than
+        # skipping past it forever.
         if backend.name == "applescript":
-            state["seen"] = (state.get("seen", []) +
-                             [m["uid"] for m in messages])[-500:]
+            state["seen"] = (state.get("seen", []) + handled)[-500:]
         else:
-            state["last_uid"] = max(int(m["uid"]) for m in messages)
+            state["last_uid"] = next_last_uid(
+                state.get("last_uid", 0),
+                [m["uid"] for m in messages],
+                unclassified,
+            )
         if dry_run:
             print(f"\nDRY RUN — nothing moved. "
                   f"Would flag {kept}, file {filed}, skip {skipped}.")

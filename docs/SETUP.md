@@ -3,12 +3,18 @@
 ## 1. Install
 
 ```bash
-git clone https://github.com/YOURNAME/inbox-triage.git
+git clone https://github.com/DavidCzartoryski/inbox-triage.git
 cd inbox-triage
 pip install -r requirements.txt
 ```
 
-Python 3.9+. No other dependencies.
+Python 3.9+, verified in CI against 3.9 and 3.12. One dependency: `anthropic`.
+
+The test suite needs no account, no API key and no network:
+
+```bash
+python tests/test_triage.py
+```
 
 ## 2. Get an API key
 
@@ -62,6 +68,14 @@ cp .env.example .env
 $EDITOR .env
 chmod 600 .env
 source .env
+```
+
+Keep the `export` on every line — `source`ing a bare `FOO="bar"` creates a shell
+variable that child processes can't see, so the agent would come up unconfigured.
+Check it took:
+
+```bash
+python -c "import os; print(os.environ['MAIL_BACKEND'], os.environ['DIGEST_TO'])"
 ```
 
 The setting worth thinking about is `NEVER_FILTER` — a comma-separated list of substrings matched against the sender. Anything matching stays in your inbox no matter what. Put your university domain in it, plus any recruiter you're actively talking to.

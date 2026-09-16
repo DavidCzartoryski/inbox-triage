@@ -1,0 +1,24 @@
+# Secrets — .env holds ANTHROPIC_API_KEY and, on the IMAP backend, a password.
+.env
+.env.*
+!.env.example
+
+# Agent state. Contains senders, subjects and summaries of your real mail:
+# private, and meaningless on any other machine.
+state.json
+state.tmp
+*.tmp
+
+# Cleanup tool output — generated, and also full of your real subject lines.
+cleanup_plan.md
+cleanup_plan.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# macOS
+.DS_Store

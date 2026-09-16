@@ -1,6 +1,8 @@
 """Offline tests. No network, no mail account, no API key required."""
 import os
+import shutil
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -20,11 +22,11 @@ def _record(*fields):
 
 
 def test_applescript_parsing_roundtrip():
-    raw = (_record("84321", "Dr. Patel <patel@univ.edu>", "Re: office hours",
+    raw = (_record("84321", "Dr. Patel <patel@univ.edu>", "", "Re: office hours",
                    "Tue Sep 15 2026", "false", "Hi,\n\nMove to 3pm?")
            + _record("84322", "CodeSignal <no-reply@codesignal.com>",
-                     "Complete your assessment", "Mon Sep 14 2026", "true",
-                     'You have 5 days. "Start" now.'))
+                     "recruiting@stripe.com", "Complete your assessment",
+                     "Mon Sep 14 2026", "true", 'You have 5 days. "Start" now.'))
     b = mb.AppleScriptBackend()
     b._run = lambda script: raw
     msgs = b.fetch_recent()
@@ -32,11 +34,63 @@ def test_applescript_parsing_roundtrip():
     assert msgs[0]["uid"] == "84321" and msgs[0]["read"] is False
     assert "Move to 3pm" in msgs[0]["body"]
     assert msgs[1]["read"] is True
+    assert msgs[1]["reply_to"] == "recruiting@stripe.com"
+    assert msgs[1]["subject"] == "Complete your assessment"
+
+
+# Regression: every key the triage path reads must be supplied by every
+# backend. This is checked against real parser output rather than hand-built
+# dicts, because a hand-built fixture can hold a key the backend never sets.
+def test_applescript_output_satisfies_triage_contract():
+    raw = _record("1", "recruiter@corp.example", "", "Online assessment",
+                  "Tue", "false", "Finish within 5 days")
+    b = mb.AppleScriptBackend()
+    b._run = lambda script: raw
+    msg = b.fetch_recent()[0]
+    rendered = t.render_for_model(msg)      # KeyError here = triage crashes
+    assert "Online assessment" in rendered
+    assert t.hard_keep(msg) is True
+
+
+def test_imap_output_satisfies_triage_contract():
+    raw = (b"From: Dr. Patel <patel@univ.edu>\r\n"
+           b"Reply-To: patel-assistant@univ.edu\r\n"
+           b"Subject: Re: your interview\r\n"
+           b"Date: Tue, 15 Sep 2026 09:00:00 -0400\r\n"
+           b"List-Unsubscribe: <https://x.example/u>\r\n"
+           b"Content-Type: text/plain\r\n\r\nCan you meet Thursday?\r\n")
+
+    class FakeIMAP:
+        def uid(self, cmd, *args):
+            if cmd == "SEARCH":
+                return "OK", [b"101"]
+            if cmd == "FETCH":
+                return "OK", [(b"101 (BODY[] {%d}" % len(raw), raw)]
+            return "OK", [b""]
+
+    b = mb.IMAPBackend.__new__(mb.IMAPBackend)   # skip credential lookup
+    b._connect = lambda: FakeIMAP()
+    msg = b.fetch_since(100)[0]
+    assert msg["reply_to"] == "patel-assistant@univ.edu"
+    assert msg["has_unsubscribe"] is True
+    rendered = t.render_for_model(msg)
+    assert "Can you meet Thursday?" in rendered
+    assert "patel-assistant@univ.edu" in rendered
+
+
+def test_unclassified_mail_is_retried_next_run():
+    # 3 and 4 failed to classify, so we must not advance past 3.
+    assert t.next_last_uid(0, ["1", "2", "3", "4"], ["3", "4"]) == 2
+    # Nothing failed: advance to the newest message.
+    assert t.next_last_uid(0, ["1", "2", "3"], []) == 3
+    # A wholly failed batch must not rewind state and re-triage the mailbox.
+    assert t.next_last_uid(50, ["51", "52"], ["51", "52"]) == 50
 
 
 def test_malformed_applescript_output_is_skipped():
     b = mb.AppleScriptBackend()
-    for junk in ("", "garbage" + RS, FS.join(["1", "2"]) + RS):
+    truncated = _record("1", "a@b.example", "", "subj", "Tue", "false")  # no body
+    for junk in ("", "garbage" + RS, FS.join(["1", "2"]) + RS, truncated):
         b._run = lambda script, j=junk: j
         assert b.fetch_recent() == []
 
@@ -88,14 +142,16 @@ def test_cleanup_report_lists_both_actions():
          "sample_subjects": [], "uids": ["2"]},
     ]
     cwd = os.getcwd()
-    os.chdir("/tmp")
+    tmp = tempfile.mkdtemp()            # don't litter the real /tmp or the repo
+    os.chdir(tmp)
     try:
         c.write_report(plan, protected=147)
-        report = Path("/tmp/cleanup_plan.md").read_text()
+        report = (Path(tmp) / "cleanup_plan.md").read_text()
         assert "Job Alerts" in report and "Dr. Patel" in report
         assert "147" in report
     finally:
         os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 # inbox-triage
 
+[![CI](https://github.com/DavidCzartoryski/inbox-triage/actions/workflows/ci.yml/badge.svg)](https://github.com/DavidCzartoryski/inbox-triage/actions/workflows/ci.yml)
+
 **An email agent for students in the middle of a job hunt.**
 
 Apply to 100 jobs and you don't get 100 emails. You get 300. A confirmation from the company, an account verification from whatever applicant tracking system they use, a "do not reply to this message" from the ATS itself, then a status update three weeks later. Stack Canvas notifications on top of that — grade posted, assignment submitted, someone replied to your discussion post — plus LinkedIn job alerts and Handshake digests, and your inbox stops being an inbox. It's a feed. And somewhere in that feed is a timed online assessment that expires in five days.
@@ -109,6 +111,16 @@ python src/icloud_triage.py triage --dry-run  # classify without acting
 ```
 
 **Run the dry run for a day or two before letting it act.** It prints every decision and changes nothing. That's when you find out it wants to file your career center's emails, and you add them to `NEVER_FILTER`.
+
+## Tests
+
+```bash
+python tests/test_triage.py
+```
+
+No account, no API key, no network. Both mail backends are driven through their
+real parsers with fake transports, so the tests cover the thing most likely to
+break silently: a backend that doesn't hand triage every field it reads.
 
 ## Tuning
 
