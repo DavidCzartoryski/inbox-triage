@@ -40,8 +40,11 @@ except ImportError:
     )
 
 import keystore
+import prefilter
+import protections
 from mail_backends import get_backend, mask
 from settings import allowlisted, load_config, matching_rules
+from verdict_cache import VerdictCache
 
 # ---------------------------------------------------------------------------
 # Config
@@ -53,6 +56,7 @@ DIGEST_TO = (os.environ.get("DIGEST_TO")
 MODEL = os.environ.get("TRIAGE_MODEL", "claude-sonnet-5")
 FILTERED_FOLDER = os.environ.get("FILTERED_FOLDER", "Filtered")
 STATE_PATH = Path(os.environ.get("TRIAGE_STATE", "state.json"))
+CACHE_PATH = Path(os.environ.get("TRIAGE_CACHE", "verdict_cache.json"))
 
 # Anything from these senders or domains is never filtered, no matter what
 # the model says. Add your school, your advisor, recruiters you trust.
@@ -60,39 +64,12 @@ NEVER_FILTER = [s.strip().lower() for s in os.environ.get(
     "NEVER_FILTER", ""
 ).split(",") if s.strip()]
 
-# If any of these appear in the subject, the message stays in the inbox and
-# gets flagged regardless of classification. Cheap insurance.
-#
-# Split into strong and weak because this layer outranks every filter toggle,
-# so a false positive here is the one kind the panel can't fix. Strong terms
-# only ever show up in mail that matters. Weak ones are shared with marketing
-# copy: "Limited-time college offer ends soon" is not a job offer, and
-# "expires" belongs to coupons as often as to assessments.
-HARD_KEEP_STRONG = [
-    r"\bonline assessment\b", r"\bcoding challenge\b", r"\bhackerrank\b",
-    r"\bcodesignal\b", r"\bkarat\b", r"\bhirevue\b",
-    r"\binterview\b", r"\bschedule a (call|time|chat)\b",
-    r"\bnext steps?\b", r"\bdeadline\b",
-    r"\baction required\b", r"\bplease (complete|confirm|respond|reply)\b",
-    r"\bverification code\b", r"\bone[- ]time (code|password)\b",
-    # Unambiguous offer phrasings, so a real offer still can't be filed.
-    r"\boffer letter\b", r"\boffer of (employment|admission|internship)\b",
-    r"\b(extend|extending|extended) (you )?an offer\b", r"\byour offer\b",
-]
-
-# Weak terms count only when the subject doesn't also read like an ad.
-HARD_KEEP_WEAK = [r"\boffer\b", r"\bexpires?\b", r"\blast chance\b"]
-
-MARKETING_VETO = [
-    r"limited[\s-]?time", r"offer ends", r"\d+%\s*off", r"\bsale\b",
-    r"(exclusive|special|introductory)\s+offer", r"\bcoupon\b", r"\bdeal[s]?\b",
-    r"\bsubscribe\b", r"free (trial|shipping)", r"act now", r"don'?t miss",
-    r"black friday", r"cyber monday", r"flash sale", r"save big",
-    r"\bpromo(tion)?\b", r"buy (one|now)", r"shop now", r"\bwebinar\b",
-]
-
-# Kept for anything importing the old name.
-HARD_KEEP_PATTERNS = HARD_KEEP_STRONG + HARD_KEEP_WEAK
+# The never-file rules now live in protections.py, shared with the header
+# prefilter so both layers honour the same guarantees.
+HARD_KEEP_STRONG = protections.HARD_KEEP_STRONG
+HARD_KEEP_WEAK = protections.HARD_KEEP_WEAK
+MARKETING_VETO = protections.MARKETING_VETO
+HARD_KEEP_PATTERNS = protections.HARD_KEEP_PATTERNS
 
 BATCH_SIZE = 8
 BODY_CHARS = 1800
@@ -202,20 +179,7 @@ def next_last_uid(current, seen_uids, unclassified):
 
 
 def hard_keep(msg):
-    # .get throughout: a backend that can't supply a field must not be able to
-    # crash triage, because a crash means nothing gets triaged at all.
-    sender = f"{msg.get('from', '')} {msg.get('reply_to', '')}".lower()
-    if any(s in sender for s in NEVER_FILTER):
-        return True
-    subject = msg.get("subject", "").lower()
-
-    if any(re.search(p, subject) for p in HARD_KEEP_STRONG):
-        return True
-    # A weak term in obviously promotional copy isn't protection, it's a
-    # marketing email squatting on the word "offer".
-    if any(re.search(p, subject) for p in HARD_KEEP_WEAK):
-        return not any(re.search(v, subject) for v in MARKETING_VETO)
-    return False
+    return protections.hard_keep(msg, never_filter=NEVER_FILTER)
 
 
 def render_for_model(msg):
@@ -256,6 +220,37 @@ def classify(client, batch):
 # ---------------------------------------------------------------------------
 
 
+def _record(msg, category, importance, summary, deadline):
+    return {"uid": msg["uid"], "from": msg["from"], "subject": msg["subject"],
+            "date": msg.get("date", ""), "category": category,
+            "importance": importance, "summary": summary, "deadline": deadline}
+
+
+def _file_message(backend, state, msg, dry_run, summary):
+    if not dry_run and not backend.move_to_filtered(msg["uid"]):
+        print(f"  move failed, left in inbox: {msg['uid']}", file=sys.stderr)
+    state["queue"].append(_record(msg, "NOISE", 0, summary, None))
+
+
+def _attach_bodies(backend, messages):
+    """Fill in bodies for messages the header layer couldn't decide."""
+    ids = [m["uid"] for m in messages]
+    try:
+        if backend.name == "applescript":
+            full = {m["uid"]: m.get("body", "")
+                    for m in backend.fetch_by_ids(ids, body_chars=BODY_CHARS,
+                                                  window=APPLESCRIPT_ID_WINDOW)}
+        else:
+            full = backend.fetch_bodies_by_ids(ids, body_chars=BODY_CHARS)
+    except Exception as exc:
+        # No body is survivable: the model still sees sender and subject.
+        print(f"  couldn't read bodies ({exc}); classifying on headers only",
+              file=sys.stderr)
+        return
+    for m in messages:
+        m["body"] = full.get(m["uid"], "")
+
+
 def run_triage(dry_run=False):
     state = load_state()
     backend = get_backend()
@@ -274,50 +269,91 @@ def run_triage(dry_run=False):
             if len(new_ids) > APPLESCRIPT_FETCH:
                 print(f"{len(new_ids)} new since last run; taking the newest "
                       f"{APPLESCRIPT_FETCH} now, rest on the next run.")
-            messages = backend.fetch_by_ids(new_ids[:APPLESCRIPT_FETCH],
-                                            body_chars=BODY_CHARS,
-                                            window=APPLESCRIPT_ID_WINDOW)
+            messages = backend.fetch_headers_by_ids(
+                new_ids[:APPLESCRIPT_FETCH], window=APPLESCRIPT_ID_WINDOW)
         else:
-            messages = backend.fetch_since(state["last_uid"],
-                                           limit=MAX_MESSAGES_PER_RUN,
-                                           body_chars=BODY_CHARS)
+            messages = backend.fetch_headers_since(
+                state["last_uid"], limit=MAX_MESSAGES_PER_RUN)
 
         if not messages:
             print("No new mail.")
             return
 
-        print(f"Fetched {len(messages)} new message(s) via {backend.name}.")
+        print(f"Fetched {len(messages)} header(s) via {backend.name}.")
 
         filed = kept = skipped = 0
         handled, unclassified = [], []
 
-        # Your toggles run first, but only on mail the protections have already
-        # cleared. Anything a rule catches is filed without an API call, which
-        # is both free and predictable.
         cfg = load_config()
+        cache = VerdictCache(CACHE_PATH)
+
+        # Headers-only triage, cheapest test first. Nothing below reads a
+        # message body, and nothing below costs a token.
+        #
+        #   1. protections   -> keep
+        #   2. your toggles  -> file
+        #   3. prefilter     -> keep / file / "ask the model"
+        #
+        # Only what survives all three is worth a body read and an API call.
         to_model = []
+        rule_filed = prefilter_filed = prefilter_kept = 0
+
         for msg in messages:
             protected = allowlisted(msg, cfg) or hard_keep(msg)
             hits = [] if protected else matching_rules(msg, cfg)
-            if not hits:
-                to_model.append(msg)
-                continue
-            handled.append(msg["uid"])
-            if not dry_run and not backend.move_to_filtered(msg["uid"]):
-                print(f"  move failed, left in inbox: {msg['uid']}",
-                      file=sys.stderr)
-            state["queue"].append({
-                "uid": msg["uid"], "from": msg["from"],
-                "subject": msg["subject"], "date": msg["date"],
-                "category": "NOISE", "importance": 0,
-                "summary": f"your filter: {', '.join(hits)}", "deadline": None,
-            })
-            filed += 1
-            print(f"  [rule    ] {msg['subject'][:52]}  ({hits[0]})")
+            key = prefilter.cache_key(msg)
 
-        if filed:
-            print(f"  {filed} filed by your filters, no API call needed.")
+            if hits:
+                handled.append(msg["uid"])
+                _file_message(backend, state, msg, dry_run,
+                              f"your filter: {', '.join(hits)}")
+                rule_filed += 1
+                filed += 1
+                print(f"  [rule    ] {msg['subject'][:50]}  ({hits[0]})")
+                continue
+
+            verdict = prefilter.decide(msg, protected=protected,
+                                       cached=cache.get(key))
+
+            if verdict.action == "file":
+                handled.append(msg["uid"])
+                _file_message(backend, state, msg, dry_run,
+                              f"headers only ({verdict.confidence:.0%}): "
+                              f"{', '.join(verdict.reasons[:3])}")
+                prefilter_filed += 1
+                filed += 1
+                print(f"  [headers ] {msg['subject'][:50]}  "
+                      f"({verdict.confidence:.0%} noise)")
+                continue
+
+            if verdict.action == "keep" and "cached_important" in verdict.reasons:
+                # Seen this exact sender+subject shape before and it mattered.
+                handled.append(msg["uid"])
+                if not dry_run:
+                    backend.flag(msg["uid"])
+                state["queue"].append(_record(msg, "PERSONAL", 60,
+                                              "remembered as important", None))
+                prefilter_kept += 1
+                kept += 1
+                print(f"  [cached  ] {msg['subject'][:50]}")
+                continue
+
+            to_model.append(msg)
+
+        decided = rule_filed + prefilter_filed + prefilter_kept
+        if decided:
+            print(f"  {decided} decided from headers alone, no API call "
+                  f"({rule_filed} by your rules, {prefilter_filed} scored as "
+                  f"bulk, {prefilter_kept} remembered).")
+
+        # Bodies are fetched only for what's left. This is the expensive part
+        # on both backends (~0.44s per message via AppleScript), so it is
+        # deliberately the last thing that happens.
         messages_for_model = to_model
+        if messages_for_model:
+            print(f"  reading {len(messages_for_model)} body(ies) for the "
+                  f"model...")
+            _attach_bodies(backend, messages_for_model)
 
         for i in range(0, len(messages_for_model), BATCH_SIZE):
             batch = messages_for_model[i:i + BATCH_SIZE]
@@ -338,16 +374,16 @@ def run_triage(dry_run=False):
                     category = "ACTION_REQUIRED"
                     v["summary"] = "Keyword override — " + v.get("summary", "")
 
-                record = {
-                    "uid": msg["uid"],
-                    "from": msg["from"],
-                    "subject": msg["subject"],
-                    "date": msg["date"],
-                    "category": category,
-                    "importance": v.get("importance", 50),
-                    "summary": v.get("summary", ""),
-                    "deadline": v.get("deadline"),
-                }
+                record = _record(msg, category, v.get("importance", 50),
+                                 v.get("summary", ""), v.get("deadline"))
+
+                # Remember the model's verdict for this sender+subject shape,
+                # so the next one like it is decided for free. Only the model
+                # writes here — the prefilter never teaches itself, or one bad
+                # heuristic call would compound into a permanent rule.
+                cache.record(prefilter.cache_key(msg), category,
+                             sender=prefilter.sender_key(msg["from"]),
+                             template=prefilter.subject_template(msg["subject"]))
 
                 if category in ("ACTION_REQUIRED", "PERSONAL"):
                     if not dry_run:
@@ -376,12 +412,19 @@ def run_triage(dry_run=False):
                 [m["uid"] for m in messages],
                 unclassified,
             )
+        asked = len(messages_for_model)
+        stats = cache.stats()
         if dry_run:
             print(f"\nDRY RUN — nothing moved. "
                   f"Would flag {kept}, file {filed}, skip {skipped}.")
         else:
             save_state(state)
+            cache.save()
             print(f"\nFlagged {kept}, filed {filed}, left alone {skipped}.")
+        print(f"Bodies read: {asked}/{len(messages)}. "
+              f"Sent to the model: {asked}. "
+              f"Cache {stats['entries']} entries, "
+              f"hit rate {stats['hit_rate']:.0%} this run.")
     finally:
         backend.close()
 

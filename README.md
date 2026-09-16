@@ -200,6 +200,81 @@ Messages are fetched with `BODY.PEEK` (IMAP) or read without setting read status
 
 Classification happens in batches of 8 to keep token costs down. Each message contributes roughly 600 tokens. At normal student volume this runs a few cents a day.
 
+## The model is the last resort, not the first
+
+Most mail is obvious from the envelope. A message from `newsdigest@` carrying
+`List-Unsubscribe`, `Feedback-ID` and `X-Campaign` headers does not need a
+language model, and paying for one is waste. So every message is scored from
+its headers first, and the body is never even read unless the score is
+ambiguous.
+
+```
+ids ──> headers ──┬─ protected keyword or allowlist? ──> keep, flag
+   (no bodies)    ├─ one of your toggles? ────────────> file
+                  ├─ scores as bulk (≥5)? ───────────> file
+                  ├─ seen this shape before? ────────> reuse that verdict
+                  └─ otherwise ──> read body ──> ask the model
+```
+
+Measured on a real inbox, 25 newest messages:
+
+| | Before | After |
+|---|---|---|
+| Bodies read | 25 | **2** |
+| Sent to the model | 25 | **2 (8%)** |
+| Tokens | ~15,000 | **~1,200** |
+
+### What the header layer looks at
+
+Bulk mail announces itself, and the giveaway is infrastructure rather than
+wording. On that same sample, 24 of 25 messages carried `List-Unsubscribe`, 24
+carried `Feedback-ID`, and 24 carried `List-Unsubscribe-Post` — the RFC 8058
+one-click header, which transactional mail like an assessment invite
+essentially never sets. Those headers are scored alongside sender shape
+(`no-reply@`, `newsdigest@`), known bulk domains, and subject templates.
+
+Evidence that a *human* wrote it — a `Re:` prefix, a `firstname.lastname`
+address, a `.edu` domain, a direct question — vetoes filing and sends the
+message to the model instead.
+
+### Why it can't file your assessment
+
+The protections in [`src/protections.py`](src/protections.py) are checked
+**inside** the prefilter, not by its caller. A message matching *assessment*,
+*interview*, *deadline*, *offer letter* or *verification code* is kept even
+with maximum bulk evidence — robot sender, every campaign header present.
+That's a test, not an intention:
+
+```python
+def test_prefilter_never_files_protected_mail_even_when_it_looks_bulk():
+```
+
+The asymmetry is deliberate. Filing an assessment is the failure that costs
+you something real; keeping a newsletter is mildly annoying. So `FILE` needs
+strong evidence and any human signal at all is enough to escalate.
+
+## Remembered verdicts
+
+Inboxes repeat. "12 new jobs for you" arrives weekly with only the number
+changing, and classifying it every time is paying twice for one conclusion.
+Verdicts are memoised in `verdict_cache.json`, keyed on **sender + subject
+template** — digits normalised away, so `12 new jobs` and `48 new jobs` are
+one entry.
+
+Keyed on both, never the sender alone. `no-reply@greenhouse.io` sends both
+"your application was received" and "complete your assessment"; a
+sender-keyed cache would let the first teach the agent to file the second.
+
+Three rules keep it honest:
+
+- **Only the model writes to it.** The prefilter never teaches itself, or one
+  bad heuristic call would compound into a permanent rule.
+- **Filing needs two observations.** One sighting isn't a pattern. A
+  *keep* verdict is reused immediately, because being wrong that way just
+  leaves mail in your inbox.
+- **Entries expire after 180 days** and the file is capped at 4,000, evicting
+  least-seen first. A newsletter you ignored last spring might matter now.
+
 ## What a run with no new mail costs
 
 Nothing. There's no separate "is there new mail" script to bolt on, because the

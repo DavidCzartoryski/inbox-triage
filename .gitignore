@@ -7,6 +7,9 @@
 # private, and meaningless on any other machine.
 state.json
 state.tmp
+
+# Learned verdicts. Contains your senders and subject shapes.
+verdict_cache.json
 *.tmp
 
 # Cleanup tool output — generated, and also full of your real subject lines.

@@ -18,10 +18,17 @@ import mail_backends as mb  # noqa: E402
 import icloud_triage as t  # noqa: E402
 import inbox_cleanup as c  # noqa: E402
 import keystore as ks  # noqa: E402
+import prefilter as pf  # noqa: E402
+import verdict_cache as vc  # noqa: E402
 import settings as st  # noqa: E402
 import subscriptions as sub  # noqa: E402
 
 FS, RS = "\x1e", "\x1d"
+
+
+def _today():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _record(*fields):
@@ -456,6 +463,188 @@ def test_digest_refuses_to_mail_the_example_address():
         assert len(state["queue"]) == 1
     finally:
         t.STATE_PATH, t.DIGEST_TO = saved_path, saved_to
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Header prefilter
+# ---------------------------------------------------------------------------
+
+BULK_HEADERS = ("List-Unsubscribe: <https://x.example/u>\r\n"
+                "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n"
+                "Feedback-ID: 123:campaign:esp\r\n"
+                "X-Campaign: fall-promo\r\n")
+
+
+def _hdr(frm, subject, headers="", reply_to=""):
+    return {"uid": "1", "from": frm, "reply_to": reply_to, "subject": subject,
+            "date": "Tue", "raw_headers": headers, "body": "",
+            "has_unsubscribe": "List-Unsubscribe:" in headers}
+
+
+# The whole safety case for a layer that files mail it has never read.
+def test_prefilter_never_files_protected_mail_even_when_it_looks_bulk():
+    for subject in ("Complete your online assessment",
+                    "Your HackerRank assessment expires in 48 hours",
+                    "Interview availability?",
+                    "Action required: verification code",
+                    "Offer letter from Stripe"):
+        # Maximum bulk evidence: robot sender, every campaign header.
+        msg = _hdr("no-reply@notifications.example", subject, BULK_HEADERS)
+        d = pf.decide(msg)
+        assert d.action == "keep", f"{subject} -> {d.action}"
+        assert d.confidence == 1.0
+
+
+def test_prefilter_does_not_trust_the_caller_to_pass_protected():
+    """decide() re-checks protections itself, so a forgetful caller is safe."""
+    msg = _hdr("no-reply@ats.example", "Complete your assessment", BULK_HEADERS)
+    assert pf.decide(msg, protected=False).action == "keep"
+
+
+def test_bulk_infrastructure_headers_are_enough_to_file():
+    msg = _hdr("newsdigest@insideapple.apple.com",
+               "A possible early sign of dementia, and other stories",
+               BULK_HEADERS)
+    d = pf.decide(msg)
+    assert d.action == "file"
+    assert d.confidence >= 0.75
+    assert "list_unsubscribe" in d.reasons and "feedback_id" in d.reasons
+
+
+def test_local_part_tokens_match_mid_word():
+    """'newsdigest@' must trip robot_local; \\bdigest@ never would."""
+    noise, _, reasons = pf.score_headers(
+        _hdr("newsdigest@insideapple.apple.com", "anything"))
+    assert "robot_local" in reasons
+
+
+def test_human_evidence_sends_it_to_the_model_instead_of_filing():
+    # Same bulk headers, but a person appears to have written it.
+    msg = _hdr("Alice Patel <alice.patel@northeastern.edu>",
+               "Re: your question about the project", BULK_HEADERS)
+    assert pf.decide(msg).action == "ask"
+
+
+def test_plain_mail_with_no_signals_goes_to_the_model():
+    assert pf.decide(_hdr("someone@startup.io", "quick note")).action == "ask"
+
+
+def test_bulk_infra_score_is_capped():
+    many = BULK_HEADERS + ("Precedence: bulk\r\nAuto-Submitted: auto-generated\r\n"
+                           "List-Id: <x.example>\r\n")
+    noise, _, _ = pf.score_headers(_hdr("x@y.example", "hello", many))
+    # 3+2+2+2+2+2+1 = 14 raw, capped at BULK_INFRA_CAP
+    assert noise <= pf.BULK_INFRA_CAP
+
+
+def test_subject_template_collapses_variants():
+    assert (pf.subject_template("12 new jobs for you")
+            == pf.subject_template("5 new jobs for you")
+            == "# new jobs for you")
+    # Different shapes must not collide.
+    assert pf.subject_template("Grade posted") != pf.subject_template("12 new jobs")
+
+
+def test_cache_key_separates_subjects_from_the_same_sender():
+    """greenhouse sends both 'application received' and 'your assessment'."""
+    sender = "no-reply@greenhouse.io"
+    a = pf.cache_key({"from": sender, "subject": "We received your application"})
+    b = pf.cache_key({"from": sender, "subject": "Complete your assessment"})
+    assert a != b
+    # But the same shape with a different number is one entry.
+    c = pf.cache_key({"from": sender, "subject": "12 new jobs for you"})
+    d = pf.cache_key({"from": sender, "subject": "48 new jobs for you"})
+    assert c == d
+
+
+# ---------------------------------------------------------------------------
+# Verdict cache
+# ---------------------------------------------------------------------------
+
+def test_cache_needs_two_observations_before_it_files():
+    """One sighting is not a pattern."""
+    msg = _hdr("mystery@unknown.example", "Some subject nobody can classify")
+    key = pf.cache_key(msg)
+
+    once = {"category": "NOISE", "n": 1, "last": _today()}
+    assert pf.decide(msg, cached=once).action == "ask"
+
+    twice = {"category": "NOISE", "n": 2, "last": _today()}
+    assert pf.decide(msg, cached=twice).action == "file"
+
+
+def test_cached_important_is_reused_immediately():
+    """Being wrong toward the inbox is cheap, so one sighting is enough."""
+    msg = _hdr("recruiter@corp.example", "Some subject")
+    cached = {"category": "PERSONAL", "n": 1, "last": _today()}
+    d = pf.decide(msg, cached=cached)
+    assert d.action == "keep" and "cached_important" in d.reasons
+
+
+def test_cache_roundtrip_and_verdict_change_resets_confidence():
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        c = vc.VerdictCache(tmp / "cache.json")
+        c.record("k1", "NOISE", sender="a@b.example", template="# new jobs")
+        c.record("k1", "NOISE", sender="a@b.example", template="# new jobs")
+        assert c.data["k1"]["n"] == 2
+        # A changed verdict must earn trust again from scratch.
+        c.record("k1", "ACTION_REQUIRED", sender="a@b.example")
+        assert c.data["k1"]["n"] == 1
+        c.save()
+        assert vc.VerdictCache(tmp / "cache.json").data["k1"]["n"] == 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_stale_cache_entries_are_ignored():
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        c = vc.VerdictCache(tmp / "cache.json")
+        c.data["old"] = {"category": "NOISE", "n": 9, "last": "2020-01-01"}
+        assert c.get("old") is None          # too old to trust
+        c.data["undated"] = {"category": "NOISE", "n": 9}
+        assert c.get("undated") is None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_corrupt_cache_costs_money_not_correctness():
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        (tmp / "cache.json").write_text("{not json")
+        c = vc.VerdictCache(tmp / "cache.json")
+        assert c.data == {}                  # starts over, doesn't crash
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_cache_is_bounded_and_evicts_least_seen():
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        c = vc.VerdictCache(tmp / "cache.json")
+        for i in range(vc.MAX_ENTRIES + 50):
+            c.data[f"k{i}"] = {"category": "NOISE", "n": 1 if i < 50 else 5,
+                               "last": _today()}
+        c.save()
+        assert len(c.data) == vc.MAX_ENTRIES
+        assert "k0" not in c.data            # n=1 evicted first
+        assert "k4000" in c.data
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_forget_sender_drops_its_entries():
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        c = vc.VerdictCache(tmp / "cache.json")
+        c.record("a", "NOISE", sender="alerts@jobs.example", template="x")
+        c.record("b", "NOISE", sender="alerts@jobs.example", template="y")
+        c.record("c", "NOISE", sender="prof@univ.edu", template="z")
+        assert c.forget_sender("alerts@jobs.example") == 2
+        assert set(c.data) == {"c"}
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 

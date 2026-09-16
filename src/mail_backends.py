@@ -143,6 +143,78 @@ class AppleScriptBackend:
         raw = self._run(script)
         return [p.strip() for p in raw.split(FIELD_SEP) if p.strip()]
 
+    def fetch_headers_by_ids(self, ids, window=50):
+        """Headers only — no message bodies read.
+
+        `all headers` gives the full RFC822 header block, which is what makes
+        List-Unsubscribe visible on this backend. Measured on a 4,046-message
+        mailbox: 25 messages with all headers took 4.6s, versus 16.3s with
+        bodies. Bodies cost ~0.44s each, so skipping them for mail the
+        prefilter can already classify is most of the win.
+        """
+        if not ids:
+            return []
+        wanted = "," + ",".join(str(int(i)) for i in ids) + ","
+        script = f'''
+        set fs to (ASCII character 30)
+        set rs to (ASCII character 29)
+        set wanted to "{wanted}"
+        set target to {len(ids)}
+        set found to 0
+        set output to ""
+        with timeout of {self.timeout} seconds
+          tell application "Mail"
+            set box to inbox
+            set n to count of messages of box
+            if n > {window} then set n to {window}
+            repeat with i from 1 to n
+              set m to message i of box
+              set mid to (id of m as string)
+              if wanted contains ("," & mid & ",") then
+                try
+                  set h to all headers of m
+                on error
+                  set h to ""
+                end try
+                try
+                  set theReplyTo to reply to of m
+                  if theReplyTo is missing value then set theReplyTo to ""
+                on error
+                  set theReplyTo to ""
+                end try
+                set output to output & mid & fs & ¬
+                  (sender of m) & fs & theReplyTo & fs & (subject of m) & fs & ¬
+                  ((date received of m) as string) & fs & ¬
+                  (read status of m as string) & fs & h & rs
+                set found to found + 1
+                if found is greater than or equal to target then exit repeat
+              end if
+            end repeat
+          end tell
+        end timeout
+        return output
+        '''
+        raw = self._run(script)
+        out = []
+        for record in raw.split(RECORD_SEP):
+            parts = record.split(FIELD_SEP)
+            if len(parts) < 7:
+                continue
+            headers = parts[6]
+            out.append({
+                "uid": parts[0].strip(),
+                "from": parts[1].strip(),
+                "reply_to": parts[2].strip(),
+                "subject": parts[3].strip(),
+                "date": parts[4].strip(),
+                "read": parts[5].strip().lower() == "true",
+                "raw_headers": headers,
+                "has_unsubscribe": bool(
+                    re.search(r"(?im)^list-unsubscribe\s*:", headers)),
+                "body": "",          # not read yet, by design
+            })
+        return out
+
     def fetch_by_ids(self, ids, body_chars=1800, window=50):
         """Full records for specific ids. Reading content does not mark read."""
         if not ids:
@@ -366,6 +438,58 @@ class IMAPBackend:
             return str(make_header(decode_header(value)))
         except Exception:
             return value
+
+    def fetch_headers_since(self, last_uid, limit=60):
+        """New UIDs with headers only. One round trip, no bodies."""
+        imap = self._connect()
+        status, data = imap.uid("SEARCH", None, f"UID {last_uid + 1}:*")
+        if status != "OK" or not data or not data[0]:
+            return []
+        uids = sorted(int(u) for u in data[0].split() if int(u) > last_uid)[-limit:]
+        if not uids:
+            return []
+
+        # Fetch every header block in a single command rather than per UID.
+        status, data = imap.uid("FETCH", ",".join(str(u) for u in uids),
+                                "(BODY.PEEK[HEADER])")
+        if status != "OK":
+            return []
+
+        out, pending = [], ""
+        for item in data:
+            if isinstance(item, tuple):
+                meta = item[0].decode("utf-8", "replace")
+                uid_match = re.search(r"UID (\d+)", meta + pending)
+                headers = item[1].decode("utf-8", "replace")
+                msg = email.message_from_string(headers)
+                out.append({
+                    "uid": uid_match.group(1) if uid_match else "",
+                    "from": self._decode(msg.get("From")),
+                    "reply_to": self._decode(msg.get("Reply-To")),
+                    "subject": self._decode(msg.get("Subject")),
+                    "date": self._decode(msg.get("Date")),
+                    "raw_headers": headers,
+                    "has_unsubscribe": bool(msg.get("List-Unsubscribe")),
+                    "body": "",
+                })
+            elif isinstance(item, bytes):
+                pending = item.decode("utf-8", "replace")
+        return [m for m in out if m["uid"]]
+
+    def fetch_bodies_by_ids(self, ids, body_chars=1800):
+        """Bodies for specific UIDs, to fill in what the prefilter can't judge."""
+        if not ids:
+            return {}
+        imap = self._connect()
+        bodies = {}
+        for uid in ids:
+            status, data = imap.uid("FETCH", str(uid), "(BODY.PEEK[TEXT])")
+            if status != "OK" or not data or not isinstance(data[0], tuple):
+                continue
+            raw = data[0][1] or b""
+            text = raw.decode("utf-8", "replace")
+            bodies[str(uid)] = re.sub(r"\n{3,}", "\n\n", text).strip()[:body_chars]
+        return bodies
 
     def fetch_since(self, last_uid, limit=60, body_chars=1800):
         imap = self._connect()
