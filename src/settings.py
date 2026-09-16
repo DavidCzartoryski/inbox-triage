@@ -104,9 +104,13 @@ RULES = [
         "label": "Marketing & promotions",
         "hint": "Sales, discounts, webinars, product announcements",
         "default": True,
-        "subject": r"(\d+% off|sale ends|last chance|limited time|"
-                   r"free (trial|webinar)|register now|don't miss|"
-                   r"exclusive offer|black friday|cyber monday|flash sale)",
+        # Hyphens matter here: real subject lines say "Limited-time offer",
+        # not "limited time offer".
+        "subject": r"(\d+%\s*off|sale ends|last chance|limited[\s-]?time|"
+                   r"free (trial|webinar)|register now|don'?t miss|"
+                   r"(exclusive|special|introductory)\s+offer|offer ends|"
+                   r"black friday|cyber monday|flash sale|shop now|"
+                   r"save big|act now|promo code)",
     },
     {
         "id": "news",

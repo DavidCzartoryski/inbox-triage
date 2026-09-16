@@ -61,14 +61,37 @@ NEVER_FILTER = [s.strip().lower() for s in os.environ.get(
 
 # If any of these appear in the subject, the message stays in the inbox and
 # gets flagged regardless of classification. Cheap insurance.
-HARD_KEEP_PATTERNS = [
+#
+# Split into strong and weak because this layer outranks every filter toggle,
+# so a false positive here is the one kind the panel can't fix. Strong terms
+# only ever show up in mail that matters. Weak ones are shared with marketing
+# copy: "Limited-time college offer ends soon" is not a job offer, and
+# "expires" belongs to coupons as often as to assessments.
+HARD_KEEP_STRONG = [
     r"\bonline assessment\b", r"\bcoding challenge\b", r"\bhackerrank\b",
     r"\bcodesignal\b", r"\bkarat\b", r"\bhirevue\b",
     r"\binterview\b", r"\bschedule a (call|time|chat)\b",
-    r"\bnext steps?\b", r"\boffer\b", r"\bexpires?\b", r"\bdeadline\b",
+    r"\bnext steps?\b", r"\bdeadline\b",
     r"\baction required\b", r"\bplease (complete|confirm|respond|reply)\b",
     r"\bverification code\b", r"\bone[- ]time (code|password)\b",
+    # Unambiguous offer phrasings, so a real offer still can't be filed.
+    r"\boffer letter\b", r"\boffer of (employment|admission|internship)\b",
+    r"\b(extend|extending|extended) (you )?an offer\b", r"\byour offer\b",
 ]
+
+# Weak terms count only when the subject doesn't also read like an ad.
+HARD_KEEP_WEAK = [r"\boffer\b", r"\bexpires?\b", r"\blast chance\b"]
+
+MARKETING_VETO = [
+    r"limited[\s-]?time", r"offer ends", r"\d+%\s*off", r"\bsale\b",
+    r"(exclusive|special|introductory)\s+offer", r"\bcoupon\b", r"\bdeal[s]?\b",
+    r"\bsubscribe\b", r"free (trial|shipping)", r"act now", r"don'?t miss",
+    r"black friday", r"cyber monday", r"flash sale", r"save big",
+    r"\bpromo(tion)?\b", r"buy (one|now)", r"shop now", r"\bwebinar\b",
+]
+
+# Kept for anything importing the old name.
+HARD_KEEP_PATTERNS = HARD_KEEP_STRONG + HARD_KEEP_WEAK
 
 BATCH_SIZE = 8
 BODY_CHARS = 1800
@@ -169,7 +192,14 @@ def hard_keep(msg):
     if any(s in sender for s in NEVER_FILTER):
         return True
     subject = msg.get("subject", "").lower()
-    return any(re.search(p, subject) for p in HARD_KEEP_PATTERNS)
+
+    if any(re.search(p, subject) for p in HARD_KEEP_STRONG):
+        return True
+    # A weak term in obviously promotional copy isn't protection, it's a
+    # marketing email squatting on the word "offer".
+    if any(re.search(p, subject) for p in HARD_KEEP_WEAK):
+        return not any(re.search(v, subject) for v in MARKETING_VETO)
+    return False
 
 
 def render_for_model(msg):

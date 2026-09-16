@@ -316,6 +316,38 @@ def test_a_sender_below_the_volume_floor_is_not_a_subscription():
 
 
 # ---------------------------------------------------------------------------
+# Keyword protection vs. marketing copy
+# ---------------------------------------------------------------------------
+
+# Regression: "Limited-time college offer ends soon" was held in the inbox
+# because \boffer\b fired. This layer outranks every filter toggle, so a false
+# positive here is the one kind the panel cannot fix.
+def test_real_opportunities_are_always_protected():
+    for subject in ("Offer letter from Stripe",
+                    "We would like to extend an offer",
+                    "Your offer from Google",
+                    "Offer of employment - Datadog",
+                    "Complete your online assessment",
+                    "Interview scheduling",
+                    "Your verification code is 123456",
+                    "Action required: application deadline Friday",
+                    "This assessment link expires in 48 hours"):
+        assert t.hard_keep(_msg("x@y.example", subject)) is True, subject
+
+
+def test_marketing_cannot_squat_on_protected_words():
+    cfg = _cfg(marketing=True)
+    for subject in ("⏰ Limited-time college offer ends soon.",
+                    "Exclusive offer: 50% off textbooks",
+                    "Your coupon expires tonight - shop now",
+                    "Last chance! Flash sale ends at midnight",
+                    "Special offer for students - act now"):
+        msg = _msg("promo@shop.example", subject, unsub=True)
+        assert t.hard_keep(msg) is False, subject
+        assert "marketing" in st.matching_rules(msg, cfg), subject
+
+
+# ---------------------------------------------------------------------------
 # Placeholder guards
 # ---------------------------------------------------------------------------
 
