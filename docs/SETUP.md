@@ -5,10 +5,33 @@
 ```bash
 git clone https://github.com/DavidCzartoryski/inbox-triage.git
 cd inbox-triage
-pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
+Use a virtualenv, not a bare `pip install`. Homebrew and most system Pythons
+are marked externally-managed (PEP 668) and will refuse to install into
+themselves:
+
+```
+error: externally-managed-environment
+```
+
+The venv also pins which interpreter runs the agent, which matters later:
+`schedule_agent.py` bakes the current interpreter's path into the launchd job,
+so install the schedule from inside the venv and the timer uses the same
+Python that has `anthropic`.
+
 Python 3.9+, verified in CI against 3.9 and 3.12. One dependency: `anthropic`.
+
+Every command below assumes the venv is active:
+
+```bash
+source .venv/bin/activate
+```
+
+If you'd rather not activate it, `.venv/bin/python` in place of `python`
+works identically.
 
 The test suite needs no account, no API key and no network:
 
@@ -259,6 +282,8 @@ Prompts for confirmation, then moves everything marked `ARCHIVE` into `Filtered`
 
 | Symptom | Cause |
 |---|---|
+| `error: externally-managed-environment` | You're installing into a Homebrew or system Python. Use the venv from step 1 |
+| `Missing dependency: anthropic` | The interpreter you ran isn't the venv's. Use `.venv/bin/python`, or activate the venv |
 | Panel says 403 | The token changes every launch. Use the URL the current process printed, not an old one |
 | Panel won't open a small window | No Chromium-family browser found; it falls back to your default browser in a normal tab |
 | Toggles saved but nothing changed | The agent reads `config.json` on its *next* run. Changing the schedule also needs `schedule_agent.py install` |

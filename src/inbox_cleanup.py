@@ -38,7 +38,13 @@ from pathlib import Path
 try:
     import anthropic
 except ImportError:
-    sys.exit("Missing dependency. Run: pip install anthropic")
+    sys.exit(
+        "Missing dependency: anthropic.\n"
+        "  python3 -m venv .venv\n"
+        "  .venv/bin/pip install -r requirements.txt\n"
+        "then run this with .venv/bin/python. A bare `pip install` is refused "
+        "by Homebrew\nand system Pythons (PEP 668, externally-managed)."
+    )
 
 PROVIDERS = {
     "icloud": ("imap.mail.me.com", 993),

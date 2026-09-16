@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-iCloud inbox triage agent.
+Inbox triage agent.
 
-Connects to iCloud Mail over IMAP, classifies new messages with Claude,
-moves low-value mail to a Filtered folder, flags the things that actually
-need you, and emails you a digest twice a day.
+Reads new mail through whichever backend is configured (Mail.app via
+AppleScript, or IMAP), files what your filter toggles catch without an API
+call, classifies the rest with Claude, flags the things that actually need
+you, and emails you a digest on the schedule you picked in the panel.
 
 Usage:
     python icloud_triage.py triage            # classify + file new mail
@@ -30,7 +31,13 @@ from pathlib import Path
 try:
     import anthropic
 except ImportError:
-    sys.exit("Missing dependency. Run: pip install anthropic")
+    sys.exit(
+        "Missing dependency: anthropic.\n"
+        "  python3 -m venv .venv\n"
+        "  .venv/bin/pip install -r requirements.txt\n"
+        "then run this with .venv/bin/python. A bare `pip install` is refused "
+        "by Homebrew\nand system Pythons (PEP 668, externally-managed)."
+    )
 
 from mail_backends import get_backend, mask
 from settings import allowlisted, load_config, matching_rules

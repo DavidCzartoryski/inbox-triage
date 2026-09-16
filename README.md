@@ -233,7 +233,9 @@ See **[docs/SETUP.md](docs/SETUP.md)** for the full walkthrough: credentials, fi
 The short version:
 
 ```bash
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
 export MAIL_BACKEND=applescript
 export ANTHROPIC_API_KEY=sk-ant-...
 export DIGEST_TO=you@icloud.com
