@@ -32,3 +32,10 @@ venv/
 
 # macOS
 .DS_Store
+
+# Job scout: recommendations, your yes/no decisions, and resume paths.
+jobs_state.json
+jobs_state.lock
+
+# What you're looking for, sent to the model with your resume. Personal.
+profile.md

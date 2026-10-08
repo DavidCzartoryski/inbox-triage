@@ -103,6 +103,18 @@
     color: var(--dim);
   }
   .empty { color: var(--dim); font-size: 11.5px; padding: 10px 0; }
+  .job { border-bottom: 1px solid var(--line); padding: 7px 0; }
+  .job:last-child { border-bottom: 0; }
+  .job .who { font-weight: 600; font-size: 12px; }
+  .job .who a { color: var(--fg); text-decoration: none; }
+  .job .score {
+    float: right; font-size: 10.5px; color: var(--accent); font-weight: 650;
+  }
+  .job .stat { color: var(--dim); font-size: 11px; margin: 1px 0 2px; }
+  .job .why { font-size: 11.5px; }
+  .job .state { font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em; }
+  .job .path { font: 10.5px ui-monospace, Menlo, monospace; word-break: break-all;
+    color: var(--dim); }
   code {
     font: 11px ui-monospace, Menlo, monospace; background: var(--card);
     padding: 1px 4px; border-radius: 3px; word-break: break-all;
@@ -119,6 +131,7 @@
   <button data-tab="filters" class="sel">Filters</button>
   <button data-tab="timing">Timing</button>
   <button data-tab="subs">Unsubs</button>
+  <button data-tab="jobs">Jobs</button>
   <button data-tab="setup">Setup</button>
 </nav>
 
@@ -158,7 +171,26 @@
     <div id="subs"><p class="empty">…</p></div>
   </section>
 
+  <section class="tab" id="tab-jobs">
+    <h2>Worth applying to</h2>
+    <div id="jobs"><p class="empty">…</p></div>
+    <h2>Tailored resumes</h2>
+    <div id="resumes"><p class="empty">…</p></div>
+  </section>
+
   <section class="tab" id="tab-setup">
+    <h2>Features</h2>
+    <label class="row">
+      <input type="checkbox" id="planner-on">
+      <span class="txt"><span class="lab">Calendar &amp; to-dos</span>
+      <span class="hint">Interviews to Calendar, deadlines to Reminders, in
+        a "Job Hunt" calendar and list of their own</span></span></label>
+    <label class="row">
+      <input type="checkbox" id="jobs-on">
+      <span class="txt"><span class="lab">Job scout</span>
+      <span class="hint">Ranks new speedyapply postings against your resume;
+        yes starts a tailored copy</span></span></label>
+
     <h2>Anthropic API key</h2>
     <div id="secret-status" class="note">…</div>
     <input type="password" id="apikey" autocomplete="off" spellcheck="false"
@@ -245,6 +277,8 @@ async function load() {
   refreshNote();
 
   $("#allowlist").value = (CFG.allowlist || []).join("\n");
+  $("#planner-on").checked = !!(CFG.planner && CFG.planner.enabled);
+  $("#jobs-on").checked = !!(CFG.jobs && CFG.jobs.enabled);
 
   const st = await (await api("/api/status")).json();
   $("#pending").textContent = st.pending_digest
@@ -270,7 +304,56 @@ async function load() {
        you — these are links you click yourself.</p>`;
 
   await loadSecrets();
+  await loadJobs();
 }
+
+async function loadJobs() {
+  const r = await (await api("/api/jobs")).json();
+  const kind = k => k === "intern" ? "internship" : "new grad";
+  $("#jobs").innerHTML = r.recommended.length
+    ? r.recommended.map(j => `<div class="job">
+        <span class="score">${j.score}</span>
+        <div class="who"><a href="${esc(j.url)}" target="_blank"
+          rel="noreferrer noopener">${esc(j.company)}: ${esc(j.title)}</a></div>
+        <div class="stat">${kind(j.kind)} · ${esc(j.location)}${(j.other_locations || []).length ? " +" + j.other_locations.length : ""}${j.salary ? " · " + esc(j.salary) : ""}</div>
+        <div class="why">${esc(j.why)}</div>
+        ${(j.tailored_before || []).length ? `<div class="stat bad">Tailored before: ${esc(j.tailored_before.join(", "))}</div>` : ""}
+        <div class="btnrow">
+          <button class="mini" data-yes="${esc(j.id)}">Yes, tailor</button>
+          <button class="mini ghost" data-no="${esc(j.id)}">No</button>
+        </div></div>`).join("")
+    : `<p class="empty">Nothing waiting.${r.last_scan ? " Last scan " +
+        esc(r.last_scan.replace("T", " ").slice(0, 16)) + "." : ""}<br>
+        <code>python src/jobs.py scan</code></p>`;
+  document.querySelectorAll("[data-yes]").forEach(b =>
+    b.onclick = () => decide(b.dataset.yes, "yes"));
+  document.querySelectorAll("[data-no]").forEach(b =>
+    b.onclick = () => decide(b.dataset.no, "no"));
+
+  const color = { ready: "ok", failed: "bad" };
+  $("#resumes").innerHTML = r.active.length
+    ? r.active.map(j => `<div class="job">
+        <div class="who">${esc(j.company)}: ${esc(j.title)}</div>
+        <span class="state ${color[j.status] || ""}">${esc(j.status)}</span>
+        ${j.desktop_pdf || j.resume_pdf ? `<div class="path">${esc(j.desktop_pdf || j.resume_pdf)}</div>` : ""}
+        ${j.error ? `<div class="path bad">${esc(j.error)}</div>` : ""}
+        </div>`).join("")
+    : `<p class="empty">Say yes to a job and its tailored resume shows up here.</p>`;
+}
+
+async function decide(id, decision) {
+  const res = await api("/api/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, decision }),
+  });
+  $("#msg").textContent = res.ok ? (decision === "yes" ? "Tailoring…" : "Passed") : "Failed";
+  $("#msg").style.color = res.ok ? "var(--on)" : "var(--danger)";
+  setTimeout(() => $("#msg").textContent = "", 2200);
+  await loadJobs();
+}
+// Tailoring takes minutes; keep the status fresh while the panel is open.
+setInterval(() => { if ($("#tab-jobs").classList.contains("sel")) loadJobs(); }, 15000);
 
 async function loadSecrets() {
   const r = await (await api("/api/secrets")).json();
@@ -329,6 +412,8 @@ $("#save").onclick = async () => {
       refresh: $("#refresh").value,
       digests_per_day: $("#digest").value,
       allowlist: $("#allowlist").value.split("\n").map(s => s.trim()).filter(Boolean),
+      planner: { enabled: $("#planner-on").checked },
+      jobs: { enabled: $("#jobs-on").checked },
     }),
   });
   $("#save").disabled = false;

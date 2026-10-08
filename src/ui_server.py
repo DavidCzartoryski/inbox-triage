@@ -15,6 +15,7 @@ wouldn't, since any page can issue requests to it.
 import argparse
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -26,7 +27,9 @@ from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import jobs  # noqa: E402
 import keystore  # noqa: E402
+import llm  # noqa: E402
 from settings import (  # noqa: E402
     DIGEST_CHOICES, PREFILTER_CHOICES, REFRESH_CHOICES, RULES,
     load_config, save_config,
@@ -99,6 +102,24 @@ class Handler(BaseHTTPRequestHandler):
                 "prefilter_choices": PREFILTER_CHOICES,
             })
 
+        if url.path == "/api/jobs":
+            state = jobs.load_state()
+            fields = ("id", "company", "title", "location", "salary", "kind",
+                      "score", "why", "url", "status", "age_days",
+                      "recommended", "resume_pdf", "desktop_pdf", "report",
+                      "error", "other_locations", "tailored_before")
+            pick = lambda j: {k: j.get(k) for k in fields}  # noqa: E731
+            active = [pick(j) for j in sorted(
+                state["jobs"].values(), key=lambda j: j.get("decided", ""),
+                reverse=True)
+                if j["status"] in ("queued", "tailoring", "ready", "failed")]
+            return self._send(200, {
+                "recommended": [pick(j) for j in jobs.pending(state)],
+                "active": active[:20],
+                "last_scan": state.get("last_scan"),
+                "backend": llm.backend(),
+            })
+
         if url.path == "/api/subscriptions":
             data = read_json_file("unsubscribe_candidates.json")
             return self._send(200, data or {"candidates": [], "scanned": 0})
@@ -155,8 +176,24 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(payload.get("allowlist"), list):
                 cfg["allowlist"] = [str(s).strip() for s in payload["allowlist"]
                                     if str(s).strip()][:200]
+            # On/off only. Calendar names, scores and sources stay in
+            # config.json, where they're easier to edit than in a 250px panel.
+            for section in ("planner", "jobs"):
+                value = (payload.get(section) or {}).get("enabled")
+                if isinstance(value, bool):
+                    cfg[section]["enabled"] = value
             save_config(cfg)
             return self._send(200, {"ok": True, "config": cfg})
+
+        if url.path == "/api/jobs":
+            decision = payload.get("decision")
+            job = str(payload.get("id") or "")
+            if decision not in ("yes", "no") or not re.fullmatch(r"[0-9a-f]{4,40}", job):
+                return self._send(400, {"error": "need an id and yes or no"})
+            results = jobs.decide([job], decision)
+            ok = all(r[1] for r in results)
+            return self._send(200 if ok else 404,
+                              {"ok": ok, "results": [r[2] for r in results]})
 
         if url.path == "/api/secrets":
             name = payload.get("name")

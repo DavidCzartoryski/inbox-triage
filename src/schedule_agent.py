@@ -20,21 +20,24 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from settings import digest_hours, load_config, refresh_minutes  # noqa: E402
+from settings import (digest_hours, job_scan_hours, load_config,  # noqa: E402
+                      refresh_minutes)
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENTS = Path.home() / "Library" / "LaunchAgents"
 TRIAGE_LABEL = "com.inboxtriage.triage"
 DIGEST_LABEL = "com.inboxtriage.digest"
+JOBS_LABEL = "com.inboxtriage.jobs"
+LABELS = (TRIAGE_LABEL, DIGEST_LABEL, JOBS_LABEL)
 
 
-def _program(command):
+def _program(command, script="src/icloud_triage.py"):
     """Run through a login shell so .env and PATH are loaded the same way."""
     env_file = ROOT / ".env"
     prefix = f"source {env_file} && " if env_file.exists() else ""
     return ["/bin/bash", "-lc",
             f"{prefix}cd {ROOT} && "
-            f"{sys.executable} src/icloud_triage.py {command}"]
+            f"{sys.executable} {script} {command}"]
 
 
 def build_plists(cfg):
@@ -57,7 +60,20 @@ def build_plists(cfg):
         "StandardErrorPath": str(ROOT / "logs" / "digest.err"),
         "ProcessType": "Background",
     }
-    return triage, digest
+    if not (cfg.get("jobs") or {}).get("enabled", True):
+        return triage, digest
+    # The lists update about once a day; scanning just before a digest puts
+    # new postings in front of you while they're fresh.
+    scan = {
+        "Label": JOBS_LABEL,
+        "ProgramArguments": _program("scan", script="src/jobs.py"),
+        "StartCalendarInterval": [{"Hour": h, "Minute": 30}
+                                  for h in job_scan_hours(cfg)],
+        "StandardOutPath": str(ROOT / "logs" / "jobs.log"),
+        "StandardErrorPath": str(ROOT / "logs" / "jobs.err"),
+        "ProcessType": "Background",
+    }
+    return triage, digest, scan
 
 
 def _launchctl(*args, check=False):
@@ -70,7 +86,15 @@ def install(cfg):
     AGENTS.mkdir(parents=True, exist_ok=True)
     minutes, hours = refresh_minutes(cfg), digest_hours(cfg)
 
-    for plist in build_plists(cfg):
+    plists = build_plists(cfg)
+    wanted = {p["Label"] for p in plists}
+    for label in LABELS:
+        stale = AGENTS / f"{label}.plist"
+        if label not in wanted and stale.exists():   # e.g. job scout turned off
+            _launchctl("unload", str(stale))
+            stale.unlink()
+            print(f"  removed {label}")
+    for plist in plists:
         path = AGENTS / f"{plist['Label']}.plist"
         _launchctl("unload", str(path))            # no-op if not loaded
         path.write_bytes(plistlib.dumps(plist))
@@ -83,6 +107,8 @@ def install(cfg):
 
     print(f"\nTriage every {minutes} min. "
           f"Digest at {', '.join(f'{h}:00' for h in hours)}.")
+    if JOBS_LABEL in wanted:
+        print(f"Job scan at {', '.join(f'{h}:30' for h in job_scan_hours(cfg))}.")
     if minutes >= 480:
         print("Note: at this interval an assessment can sit unflagged for "
               f"up to {minutes // 60}h. Checking more often costs no more — "
@@ -95,7 +121,7 @@ def install(cfg):
 
 def status():
     out = _launchctl("list").stdout
-    for label in (TRIAGE_LABEL, DIGEST_LABEL):
+    for label in LABELS:
         line = next((l for l in out.splitlines() if label in l), None)
         print(f"{label}: {'loaded — ' + line.split()[0] if line else 'not loaded'}")
     cfg = load_config()
@@ -104,7 +130,7 @@ def status():
 
 
 def uninstall():
-    for label in (TRIAGE_LABEL, DIGEST_LABEL):
+    for label in LABELS:
         path = AGENTS / f"{label}.plist"
         _launchctl("unload", str(path))
         if path.exists():
@@ -123,6 +149,8 @@ def cron_lines(cfg):
         f"python3 src/icloud_triage.py triage >> logs/triage.log 2>&1",
         f"0 {','.join(str(h) for h in hours)} * * * cd {ROOT} && . ./.env && "
         f"python3 src/icloud_triage.py digest >> logs/digest.log 2>&1",
+        f"30 {','.join(str(h) for h in job_scan_hours(cfg))} * * * cd {ROOT} && "
+        f". ./.env && python3 src/jobs.py scan >> logs/jobs.log 2>&1",
     ]
 
 
