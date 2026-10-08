@@ -40,6 +40,8 @@ except ImportError:
     )
 
 import keystore
+import llm
+import planner
 import prefilter
 import protections
 from mail_backends import get_backend, mask
@@ -134,12 +136,38 @@ Decision rules:
   5 days" is ACTION_REQUIRED, even from the same company and same system.
 - Being automated does not make something NOISE. Assessment invites are
   almost always automated.
-
+""" + planner.PLAN_PROMPT + """
 Return ONLY a JSON array, no prose and no markdown fences. One object per
 email, in the order given:
 [{"uid": "123", "category": "ACTION_REQUIRED", "importance": 0-100,
   "summary": "under 12 words, what it is and what to do",
-  "deadline": "the stated deadline or null"}]"""
+  "deadline": "the stated deadline or null",
+  "plan": null or {"kind": "event" or "todo", "title": "...",
+                   "start": "...", "end": "...", "due": "...", "tz": "...",
+                   "location": "...", "link": "..."}}]"""
+
+# The same reply, as a schema. The Claude Code route enforces it; the API
+# route is told the shape in the prompt and parsed leniently, as before.
+VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {"results": {"type": "array", "items": {
+        "type": "object",
+        "properties": {
+            "uid": {"type": "string"},
+            "category": {"type": "string", "enum": [
+                "ACTION_REQUIRED", "PERSONAL", "FYI", "NOISE"]},
+            "importance": {"type": "integer"},
+            "summary": {"type": "string"},
+            "deadline": {"type": ["string", "null"]},
+            "plan": planner.PLAN_SCHEMA,
+        },
+        "required": ["uid", "category", "importance", "summary", "deadline",
+                     "plan"],
+        "additionalProperties": False,
+    }}},
+    "required": ["results"],
+    "additionalProperties": False,
+}
 
 # ---------------------------------------------------------------------------
 # State
@@ -189,13 +217,21 @@ def render_for_model(msg):
         f"From: {msg.get('from', '(unknown)')}\n"
         f"Reply-To: {msg.get('reply_to') or '(none)'}\n"
         f"Subject: {msg.get('subject', '(no subject)')}\n"
+        f"Date: {msg.get('date') or '(unknown)'}\n"
         f"Bulk mail headers: {'yes' if msg.get('has_unsubscribe') else 'no'}\n"
         f"Body:\n{msg.get('body') or '(empty)'}\n"
     )
 
 
 def classify(client, batch):
-    payload = "\n---\n".join(render_for_model(m) for m in batch)
+    """Verdicts keyed by uid. `client` is None on the Claude Code route."""
+    # Today's date lets the model turn "within 5 days" into a due date. It
+    # goes in the message, not the system prompt, so the prompt stays fixed.
+    now = datetime.now().astimezone()
+    payload = (f"Today is {now.strftime('%A, %B %-d, %Y, %-I:%M %p %Z')}.\n\n"
+               + "\n---\n".join(render_for_model(m) for m in batch))
+    if client is None:
+        return _classify_cli(payload)
     for attempt in range(3):
         try:
             resp = client.messages.create(
@@ -216,6 +252,35 @@ def classify(client, batch):
     return {}  # fail safe: caller leaves everything in the inbox
 
 
+def _classify_cli(payload):
+    """Same verdicts through Claude Code, for when there's no API key."""
+    for attempt in range(3):
+        try:
+            data = llm.ask_json(
+                SYSTEM_PROMPT + '\nWrap the array as {"results": [...]}.',
+                payload, VERDICT_SCHEMA, model=MODEL, effort="low",
+                timeout=300)
+            return {str(r["uid"]): r for r in data.get("results", [])
+                    if isinstance(r, dict) and "uid" in r}
+        except llm.LLMError as exc:
+            print(f"  model error: {exc}", file=sys.stderr)
+            time.sleep(2 ** attempt)
+    return {}
+
+
+def make_client():
+    """An API client, or None when the Claude Code route will be used."""
+    route = llm.backend()
+    if route is None:
+        sys.exit("No way to reach the model: no Anthropic API key and no "
+                 "Claude Code CLI.\n"
+                 "  .venv/bin/python src/keystore.py set anthropic-api-key\n"
+                 "or install Claude Code and run `claude` once to log in.")
+    if route == "claude-code":
+        return None
+    return anthropic.Anthropic(api_key=keystore.api_key())
+
+
 # ---------------------------------------------------------------------------
 # Triage
 # ---------------------------------------------------------------------------
@@ -225,6 +290,29 @@ def _record(msg, category, importance, summary, deadline):
     return {"uid": msg["uid"], "from": msg["from"], "subject": msg["subject"],
             "date": msg.get("date", ""), "category": category,
             "importance": importance, "summary": summary, "deadline": deadline}
+
+
+def _plan(plans, msg, verdict, category, record, dry_run):
+    """Put what the model found on the calendar or the to-do list.
+
+    Only for mail that stays visible or matters (never NOISE), and only
+    after the item passes planner.normalize. A failed write is noted on the
+    record so the digest can say "add this yourself".
+    """
+    if not plans.enabled or category == "NOISE":
+        return
+    item = planner.normalize(verdict.get("plan"), msg)
+    if not item:
+        return
+    status, what = plans.add(item, dry_run=dry_run)
+    if status == "failed":
+        record["plan_failed"] = f"{item['kind']}: {item['title']}"
+        print(f"             couldn't add {what}; it's in the digest instead")
+        return
+    record["planned"] = what
+    tag = {"added": "added", "dry-run": "would add",
+           "duplicate": "already on"}[status]
+    print(f"             {tag} {what}  ({item['title']})")
 
 
 def _file_message(backend, state, msg, dry_run, summary):
@@ -255,7 +343,8 @@ def _attach_bodies(backend, messages):
 def run_triage(dry_run=False):
     state = load_state()
     backend = get_backend()
-    client = anthropic.Anthropic(api_key=keystore.api_key())
+    client = make_client()
+    plans = planner.Planner(state)
 
     try:
         if backend.name == "applescript":
@@ -331,7 +420,11 @@ def run_triage(dry_run=False):
                       f"({verdict.confidence:.0%} noise)")
                 continue
 
-            if verdict.action == "keep" and "cached_important" in verdict.reasons:
+            # Remembered as important. With the planner on it still goes to
+            # the model, since only a body read can find the interview time
+            # or the deadline; that's the mail where missing one costs most.
+            if (verdict.action == "keep" and "cached_important" in verdict.reasons
+                    and not plans.enabled):
                 # Seen this exact sender+subject shape before and it mattered.
                 handled.append(msg["uid"])
                 if not dry_run:
@@ -405,6 +498,7 @@ def run_triage(dry_run=False):
                     filed += 1
                     label = "filed-fyi" if category == "FYI" else "filed    "
                     print(f"  [{label}] {msg['subject'][:60]}")
+                _plan(plans, msg, v, category, record, dry_run)
 
         # Only remember what we actually classified. An API outage leaves the
         # mail in the inbox, and the next run must pick it up again rather than
@@ -439,7 +533,7 @@ def run_triage(dry_run=False):
 # ---------------------------------------------------------------------------
 
 
-def build_digest(queue):
+def build_digest(queue, extra_html=""):
     order = {"ACTION_REQUIRED": 0, "PERSONAL": 1, "FYI": 2, "NOISE": 3}
     buckets = {k: [] for k in order}
     for item in queue:
@@ -462,6 +556,14 @@ def build_digest(queue):
                             f'margin-top:2px">Deadline: {esc(it["deadline"])}</div>')
             detail = (f'<div style="color:#555;font-size:13px;margin-top:2px">'
                       f'{esc(it.get("summary"))}</div>') if show_detail else ""
+            if it.get("planned"):
+                detail += (f'<div style="color:#16a34a;font-size:13px;'
+                           f'margin-top:2px">Added: {esc(it["planned"])}</div>')
+            elif it.get("plan_failed"):
+                detail += (f'<div style="color:#b34700;font-size:13px;'
+                           f'margin-top:2px">Couldn\'t add to your calendar or '
+                           f'to-dos ({esc(it["plan_failed"])}). Add it yourself.'
+                           f'</div>')
             rows.append(
                 f'<li style="margin:0 0 14px 0">'
                 f'<div style="font-weight:600;font-size:15px">{esc(it["subject"])}</div>'
@@ -486,6 +588,7 @@ def build_digest(queue):
         + section("Needs your attention", buckets["ACTION_REQUIRED"], "#c0392b")
         + section("From a person", buckets["PERSONAL"], "#1a5490")
         + section("Worth knowing", buckets["FYI"], "#6b6b6b")
+        + extra_html
         + (f'<p style="color:#888;font-size:13px;margin-top:28px;'
            f'padding-top:14px;border-top:1px solid #eee">'
            f'{filed_count} routine message(s) moved to '
@@ -499,12 +602,14 @@ def build_digest(queue):
         subject = f"Inbox: {urgent} need{'s' if urgent == 1 else ''} action"
     elif buckets["PERSONAL"]:
         subject = f"Inbox: {len(buckets['PERSONAL'])} personal message(s)"
-    else:
+    elif queue:
         subject = "Inbox: nothing urgent"
+    else:
+        subject = "Inbox: job updates"
     return subject, body
 
 
-def build_plain_digest(queue):
+def build_plain_digest(queue, extra_plain=""):
     """Mail.app outgoing messages are plain text only."""
     order = ["ACTION_REQUIRED", "PERSONAL", "FYI"]
     titles = {"ACTION_REQUIRED": "NEEDS YOUR ATTENTION",
@@ -524,8 +629,15 @@ def build_plain_digest(queue):
                 lines.append(f"  {it['summary']}")
             if it.get("deadline"):
                 lines.append(f"  DEADLINE: {it['deadline']}")
+            if it.get("planned"):
+                lines.append(f"  Added: {it['planned']}")
+            elif it.get("plan_failed"):
+                lines.append(f"  Couldn't add to your calendar or to-dos "
+                             f"({it['plan_failed']}). Add it yourself.")
             lines.append("")
         lines.append("")
+    if extra_plain:
+        lines += [extra_plain, ""]
     filed = sum(1 for i in queue if i["category"] == "NOISE")
     if filed:
         lines.append(f"{filed} routine message(s) moved to {FILTERED_FOLDER}. "
@@ -533,9 +645,29 @@ def build_plain_digest(queue):
     return "\n".join(lines)
 
 
+def job_digest():
+    """The job scout's part of the digest: (recs, total, done, html, plain).
+
+    A broken jobs file must never stop the mail digest, so any error here
+    just means no job section this time.
+    """
+    try:
+        import jobs
+        recs, total, done = jobs.digest_items(jobs.load_state(),
+                                              jobs.job_settings()["digest_max"])
+        if not recs and not done:
+            return [], 0, [], "", ""
+        return (recs, total, done, jobs.digest_html(recs, total, done),
+                jobs.digest_plain(recs, total, done))
+    except Exception as exc:
+        print(f"  job section skipped: {exc}", file=sys.stderr)
+        return [], 0, [], "", ""
+
+
 def run_digest():
     state = load_state()
-    if not state["queue"]:
+    recs, total, done, jobs_html, jobs_plain = job_digest()
+    if not state["queue"] and not recs and not done:
         print("Nothing queued; no digest sent.")
         return
 
@@ -547,8 +679,10 @@ def run_digest():
                  "The digest contains your subject lines and senders. Set "
                  "DIGEST_TO to your own address in .env.")
 
-    subject, html_body = build_digest(state["queue"])
-    plain_body = build_plain_digest(state["queue"])
+    subject, html_body = build_digest(state["queue"], jobs_html)
+    plain_body = build_plain_digest(state["queue"], jobs_plain)
+    if recs:
+        subject += f" · {total} job{'s' if total != 1 else ''} to look at"
 
     backend = get_backend()
     try:
@@ -560,6 +694,9 @@ def run_digest():
     state["queue"] = []
     state["last_digest"] = datetime.now(timezone.utc).isoformat()
     save_state(state)
+    if recs or done:
+        import jobs
+        jobs.mark_digested(recs, done)
     print(f"Digest sent to {DIGEST_TO}: {subject}")
 
 
@@ -578,7 +715,8 @@ def config_problems(require_digest_to=True):
     problems = []
     # keystore.api_key() checks the environment first, then the Keychain, and
     # ignores the shipped placeholder so it can't shadow a real stored key.
-    if not keystore.api_key():
+    # With no key, a logged-in Claude Code CLI is the fallback route.
+    if not keystore.api_key() and not llm.claude_bin():
         raw = os.environ.get("ANTHROPIC_API_KEY", "")
         if raw and "..." in raw:
             problems.append(
@@ -591,7 +729,9 @@ def config_problems(require_digest_to=True):
             problems.append(
                 "No Anthropic API key found. Store one in the Keychain:\n"
                 "      .venv/bin/python src/keystore.py set anthropic-api-key\n"
-                "    or set ANTHROPIC_API_KEY in .env and `source .env`")
+                "    or set ANTHROPIC_API_KEY in .env and `source .env`,\n"
+                "    or install Claude Code and log in, to run on your "
+                "Claude subscription instead")
 
     if require_digest_to:
         if not DIGEST_TO:
@@ -632,6 +772,20 @@ def run_test():
         print(f"  ! {p}", file=sys.stderr)
     if blocking:
         sys.exit("\nFix the above in .env, then `source .env` again and re-run.")
+
+    if llm.backend() == "claude-code":
+        try:
+            llm.ask_json("Reply with ok set to true.", "ping",
+                         {"type": "object", "properties": {"ok": {"type": "boolean"}},
+                          "required": ["ok"], "additionalProperties": False},
+                         model=MODEL, effort="low", timeout=120)
+        except llm.LLMError as exc:
+            sys.exit(f"Claude Code CLI didn't answer: {exc}\n"
+                     "  Run `claude` once in Terminal to log in.")
+        print(f"Claude Code OK, no API key needed (model: {MODEL}, "
+              f"CLI: {llm.claude_bin()})")
+        print("\nReady. Next: .venv/bin/python src/icloud_triage.py triage --dry-run")
+        return
 
     client = anthropic.Anthropic(api_key=keystore.api_key())
     try:

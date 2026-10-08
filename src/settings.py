@@ -182,6 +182,24 @@ DEFAULT_CONFIG = {
         "max_read_rate": 0.2,   # you open 20% or less of what they send
         "window_days": 120,
     },
+    # Interviews to Calendar, deadlines to Reminders. See planner.py.
+    "planner": {
+        "enabled": True,
+        "calendar": "Job Hunt",
+        "reminders_list": "Job Hunt",
+        "alert_minutes": 30,    # before an interview
+    },
+    # New postings from the speedyapply lists, ranked against your resume.
+    # See jobs.py. "exclude" defaults to jobs.DEFAULT_EXCLUDE when absent.
+    "jobs": {
+        "enabled": True,
+        "sources": ["intern_usa", "new_grad_usa"],
+        "max_age_days": 14,     # older postings are skipped without asking
+        "min_score": 70,        # 0-100; below this isn't recommended
+        "digest_max": 10,       # recommendations per digest
+        "locations": [],        # e.g. ["Boston", "New York"]; empty = anywhere
+        "scan_hours": [7, 12],  # just before the 8:00 and 13:00 digests
+    },
 }
 
 
@@ -205,6 +223,10 @@ def load_config(path=None):
             # that no longer exists.
             cfg["filters"].update(
                 {k: bool(v) for k, v in value.items() if k in cfg["filters"]})
+        elif key in cfg and isinstance(cfg[key], dict) and isinstance(value, dict):
+            # Merge, so a config written before a setting existed still gets
+            # that setting's default instead of a KeyError.
+            cfg[key].update(value)
         elif key in cfg:
             cfg[key] = value
     return cfg
@@ -233,6 +255,13 @@ def prefilter_threshold(cfg):
         if c["id"] == choice:
             return c["threshold"]
     return 5
+
+
+def job_scan_hours(cfg):
+    hours = (cfg.get("jobs") or {}).get("scan_hours", [7, 12])
+    clean = sorted({int(h) for h in hours
+                    if isinstance(h, (int, float)) and 0 <= int(h) <= 23})
+    return clean or [7, 12]
 
 
 def digest_hours(cfg):

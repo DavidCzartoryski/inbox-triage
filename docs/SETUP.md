@@ -43,6 +43,11 @@ python tests/test_triage.py
 
 From [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys). Billed per use, separate from a Claude.ai subscription. At normal student mail volume, expect a few cents a day.
 
+**Or skip this step** if you use Claude Code. With no API key set, the agent
+runs its model calls through the `claude` CLI on your Claude subscription.
+Install it, run `claude` once in Terminal to log in, and `icloud_triage.py
+test` will report `Claude Code OK, no API key needed`.
+
 **Never paste a key into a source file.** Anything in the code gets committed, and a key pushed to a public repo is compromised the moment it lands. Two safe places, in order of preference:
 
 ```bash
@@ -192,12 +197,13 @@ The panel's Timing tab records your choice; this applies it:
 ```bash
 python src/schedule_agent.py install     # writes and loads launchd jobs
 python src/schedule_agent.py status      # what's loaded
-python src/schedule_agent.py uninstall   # remove both jobs
+python src/schedule_agent.py uninstall   # remove all three jobs
 python src/schedule_agent.py cron        # print cron lines instead
 ```
 
-Re-run `install` any time you change the cadence — it rewrites both plists
-from `config.json`. Logs land in `logs/`.
+Re-run `install` any time you change the cadence — it rewrites the plists
+from `config.json`: triage, digest, and the job scan unless `jobs.enabled` is
+off. Logs land in `logs/`.
 
 Prefer frequent checks and infrequent digests. You're billed per email
 classified, not per check, so a 15-minute interval costs the same as a
@@ -283,7 +289,28 @@ Caveats worth knowing before you depend on it:
 - **Your app password sits in GitHub's secret store.** That's reasonable, but it's one more place it exists. If that bothers you, use launchd on your own machine.
 - Make the repo **private** if you go this route.
 
-## 9. Find subscriptions worth leaving
+## 9. Calendar, to-dos and the job scout
+
+```bash
+python src/planner.py test     # creates the "Job Hunt" calendar and list;
+                               # approve both macOS prompts
+python src/jobs.py scan        # first scan of the speedyapply lists
+python src/jobs.py list
+```
+
+For the job scout, point `RESUME_DIR` in `.env` at a repo holding `resume.tex`
+(default `~/resume`), and optionally write `profile.md` in this repo: the roles
+you want, your graduation date, location limits. Both go to the model with
+every scan; the resume's heading, with your phone number and email, is cut
+first.
+
+Saying yes runs Claude Code inside `RESUME_DIR`, so tailoring follows that
+repo's `AGENTS.md` or `CLAUDE.md`. Write your tailoring rules there: one page,
+which sections can move, how to build and check it. `schedule_agent.py install`
+adds a third launchd job for the scan, at :30 past each hour in
+`jobs.scan_hours` (7 and 12 by default), so new postings make the next digest.
+
+## 10. Find subscriptions worth leaving
 
 ```bash
 export MAIL_BACKEND=imap
@@ -303,7 +330,7 @@ your decision, so the tool leaves it to you.
 Run the triage agent for a few weeks before relying on this — read rates need
 history to mean anything.
 
-## 10. Clean out the backlog
+## 11. Clean out the backlog
 
 Once, with the IMAP backend:
 

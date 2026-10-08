@@ -22,3 +22,5 @@ jobs:
         run: python -m compileall -q src tests
       - name: Run offline test suite
         run: python tests/test_triage.py
+      - name: Run planner, job scout and tailoring tests
+        run: python tests/test_jobs.py

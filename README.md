@@ -33,6 +33,120 @@ This is deliberate. An agent that deletes on a misclassification turns a recover
 
 Every ambiguous call is resolved downward. When the model is unsure it keeps. When the API errors out or returns unparseable JSON, the message is left exactly where it was. When a subject line matches a hard-coded keyword like *assessment* or *interview*, it stays in your inbox regardless of what the classifier decided.
 
+## Interviews on your calendar, deadlines on your to-do list
+
+Flagging an assessment is half the job. The other half is not forgetting it
+on day four of five. So the same model call that classifies a message also
+says whether it belongs on your calendar or your to-do list:
+
+| The email says | What gets added |
+|---|---|
+| "Your interview is confirmed for Thu Oct 15, 2:00 PM PT" | **Calendar event**, converted to your time zone, with an alert 30 minutes before |
+| "Complete this CodeSignal assessment within 5 days" | **Reminder** due five days after the email's date, alerting the morning before |
+| "Please send your transcript by Friday" | **Reminder** due Friday |
+| "Can you share your availability?" | **Reminder**, no due date, high priority |
+
+It costs no extra API call: the body is already being read. (One exception:
+mail [remembered](#remembered-verdicts) as important would normally skip the
+model, but with the planner on it still gets read, since only the body holds
+the interview time.) Everything lands in
+a calendar and a Reminders list called **Job Hunt**, created on first use, so
+the agent's additions never mix with yours and hide with one checkbox. It only
+adds; nothing edits or deletes an event.
+
+Everything the model returns is checked before it touches your calendar. A date
+that doesn't parse, an interview that already happened, or a deadline that has
+passed is dropped. A link goes in only if it appears word for word in the
+email, so a made-up URL can never reach your calendar. The same interview mentioned in three
+emails is added once. If Calendar refuses the write, the digest says so and
+tells you to add it yourself; it isn't lost silently.
+
+```bash
+python src/planner.py test     # run once from Terminal: creates "Job Hunt"
+                               # and triggers the macOS permission prompts
+python src/planner.py list     # what's been added so far
+```
+
+Run `test` before scheduling. macOS asks for Automation permission the first
+time an app touches Calendar or Reminders, and a background launchd job can't
+answer the prompt.
+
+## Job scout
+
+Twice a day it reads the [speedyapply 2027 SWE lists](https://github.com/speedyapply/2027-SWE-College-Jobs)
+(USA internships and USA new grad by default), finds the postings it hasn't
+seen, and ranks them against your resume:
+
+```bash
+python src/jobs.py scan            # fetch, filter, rank (scheduled for you)
+python src/jobs.py list            # what's waiting on a yes or no
+python src/jobs.py yes 2bbf        # tailor a resume for this one
+python src/jobs.py no 63dc         # pass
+python src/jobs.py status          # tailoring progress and finished PDFs
+```
+
+Cheapest test first, as with mail. Postings already seen, postings older than
+14 days, and titles you'd never apply to (PhD, senior, clearance-only, high
+school) are dropped for free. The same role posted once per city is kept once.
+What's left goes to the model one line per posting, scored 0 to 100 with a
+one-line reason. On the first real scan, 1,535 postings came down to 428 to
+rank; that took 85 seconds through Claude Code and recommended 20 distinct
+roles. Later scans only rank what's new since the last one.
+
+Recommendations show up in the digest, in the panel's **Jobs** tab with Yes and
+No buttons, and in `jobs.py list`. A posting for a company you've tailored a
+resume for before says so.
+
+**What the model sees about you:** `resume.tex` from your resume repo with the
+heading cut off (no phone number, no email address), plus `profile.md` in this
+repo if you write one: the roles you want, your graduation date, location
+limits. `profile.md` is gitignored. Nothing from your mailbox goes into a
+ranking.
+
+Tune it in `config.json` under `"jobs"`: `min_score` (default 70), `max_age_days`,
+`locations` (empty means anywhere), `sources` (add `intern_intl` or
+`new_grad_intl`), and `exclude`, the title patterns dropped for free. Remove the
+clearance pattern if you hold one.
+
+## Say yes, get a tailored resume
+
+Yes queues the posting for a background worker, one job at a time:
+
+1. **Fetch the full description** from the posting's applicant tracking system:
+   Greenhouse, Lever, Ashby, Workday and Eightfold through their public JSON
+   APIs, anything else from the page itself (schema.org `JobPosting` data first).
+2. **Copy `resume.tex`** to `build/tailored/<company>-<role>/` in your resume
+   repo.
+3. **Run Claude Code in that repo** with the description and the role type
+   (internship or new grad). Your repo's own `AGENTS.md` or `CLAUDE.md` decides
+   what changes, how it's built and what checks it has to pass. This project
+   never edits a resume itself.
+4. **Check the result.** A PDF has to come out, and `resume.tex` has to be
+   untouched. Then the PDF is copied to your Desktop as
+   `<name>_<Company>.pdf` and a reminder lands in Job Hunt: *Apply: Company
+   Role*, due in two days, with the posting link.
+
+The description is web content anyone can write, so the Claude Code session
+that reads it runs boxed in: `--permission-mode dontAsk` refuses anything not on
+the list; writes and edits are allowed only under `build/tailored/`; Bash is
+allowed only for `./build.sh` and read-only `git` and `ls`. WebFetch is granted
+only when the description couldn't be fetched beforehand. If a stray bare
+`./build.sh` rewrites `resume.pdf`, it's restored from a snapshot. **Read the
+tailored PDF before you send it.**
+
+Each run leaves `JOB.md` (the description it used) and `REPORT.md` (what changed
+and why) next to the PDF, and `jobs.py status` prints the command to reopen the
+session and keep iterating: `claude --resume <id>`.
+
+## No API key? Use Claude Code
+
+With no Anthropic API key set, triage and the job scout use the `claude` CLI
+in headless mode instead, on your Claude subscription. Those calls run with
+`--safe-mode` and no tools: a plain model call, with none of your CLAUDE.md,
+plugins, hooks or MCP servers loaded, and the reply checked against the same
+JSON schema. An API key, when present, still wins. Force one route with
+`LLM_BACKEND=api` or `LLM_BACKEND=claude-code`.
+
 ## The settings panel
 
 ```bash
@@ -454,7 +568,9 @@ export DIGEST_TO=you@icloud.com
 python src/icloud_triage.py test              # verify connections
 python src/ui_server.py                       # pick your filters and cadence
 python src/icloud_triage.py triage --dry-run  # classify without acting
-python src/schedule_agent.py install          # run it on a timer
+python src/planner.py test                    # Calendar + Reminders access
+python src/jobs.py scan                       # first job scan
+python src/schedule_agent.py install          # run it all on a timer
 ```
 
 **Run the dry run for a day or two before letting it act.** It prints every decision and changes nothing. That's when you find out it wants to file your career center's emails, and you add them to the allowlist.
@@ -463,6 +579,7 @@ python src/schedule_agent.py install          # run it on a timer
 
 ```bash
 python tests/test_triage.py
+python tests/test_jobs.py      # planner, job scout, tailoring worker
 ```
 
 No account, no API key, no network. Both mail backends are driven through their
@@ -490,6 +607,14 @@ Mail filed by a rule says so in the digest (`your filter: job_boards`), so you c
 - **AppleScript mode needs the Mac awake** and Mail.app running. A sleeping laptop means delayed triage.
 - **Classification is probabilistic.** The overrides exist because it will be wrong sometimes. Read the digest.
 - **The panel is not a running app.** It's a local server you start when you want to change something, not a menu bar item that's always there.
+- **Calendar and Reminders are macOS only**, through AppleScript. There's no
+  Google Calendar or Outlook writer yet.
+- **The job scout ranks titles, not descriptions.** Postings are scored from
+  company, title, location and pay; the full description is only fetched once
+  you say yes.
+- **Some career sites render in the browser** (TikTok, for one), so no
+  description can be fetched for them. Tailoring then falls back to WebFetch
+  and, failing that, to the title alone, and the report says so.
 - **`\Seen` is an imperfect read signal.** Preview panes mark mail read, so unsubscribe candidates may be undercounted. Subscription analysis is IMAP-only.
 
 ## Roadmap

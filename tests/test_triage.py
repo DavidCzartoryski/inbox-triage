@@ -413,8 +413,10 @@ def test_placeholder_api_key_is_caught_before_any_request():
     saved_env = dict(os.environ)
     saved_get = ks.get_secret
     try:
-        # Empty Keychain, so the result doesn't depend on the dev's machine.
+        # Empty Keychain and no Claude Code CLI, so the result doesn't
+        # depend on the dev's machine.
         ks.get_secret = lambda name, service=ks.SERVICE: None
+        os.environ["CLAUDE_BIN"] = "/nonexistent/claude"
 
         os.environ["ANTHROPIC_API_KEY"] = "sk-ant-..."
         problems = t.config_problems(require_digest_to=False)
@@ -432,6 +434,11 @@ def test_placeholder_api_key_is_caught_before_any_request():
         # A key in the Keychain alone is enough — no .env required.
         os.environ.pop("ANTHROPIC_API_KEY", None)
         ks.get_secret = lambda name, service=ks.SERVICE: "sk-ant-stored"
+        assert t.config_problems(require_digest_to=False) == []
+
+        # No key at all, but a Claude Code CLI: that's a working route too.
+        ks.get_secret = lambda name, service=ks.SERVICE: None
+        os.environ["CLAUDE_BIN"] = sys.executable   # any file that exists
         assert t.config_problems(require_digest_to=False) == []
     finally:
         ks.get_secret = saved_get
